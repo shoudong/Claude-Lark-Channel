@@ -1,0 +1,12 @@
+{
+  "name": "lark-channel",
+  "description": "Lark channel for Claude Code — messaging bridge with sender and chat filtering. Messages from Lark are forwarded to the Claude Code session.",
+  "version": "0.2.0",
+  "keywords": [
+    "lark",
+    "feishu",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}
