@@ -207,6 +207,85 @@ async function callHaiku(prompt: string, maxTokens = 300, purpose = "haiku"): Pr
   return (data.content?.[0]?.text || "").trim();
 }
 
+// --- Direct Sonnet API for tool-free tasks ---
+
+const DISTRESS_SIGNALS = [
+  "i don't have access",
+  "i can't see",
+  "i cannot see",
+  "could you share",
+  "could you paste",
+  "could you provide",
+  "no content visible",
+  "no email visible",
+  "no email content",
+  "no document visible",
+  "i'm unable to",
+  "i am unable to",
+  "please share",
+  "please paste",
+  "please provide the",
+  "not visible in this conversation",
+];
+
+function isDistressResponse(text: string): boolean {
+  const lower = text.toLowerCase();
+  return text.length < 20 || DISTRESS_SIGNALS.some((sig) => lower.includes(sig));
+}
+
+type SonnetDirectResult = {
+  reply: string;
+  fallback: boolean;
+  usage: ClaudeUsage;
+  costUsd: number;
+};
+
+async function callSonnetDirect(prompt: string, maxTokens = 2000): Promise<SonnetDirectResult> {
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": CONFIG.anthropicApiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: CONFIG.defaultModel === "sonnet" ? "claude-sonnet-4-6" : CONFIG.defaultModel,
+      max_tokens: maxTokens,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Sonnet Direct API ${resp.status}: ${err}`);
+  }
+  const data = (await resp.json()) as any;
+  const reply = (data.content?.[0]?.text || "").trim();
+  const usage: ClaudeUsage = {
+    input_tokens: data.usage?.input_tokens || 0,
+    output_tokens: data.usage?.output_tokens || 0,
+    cache_creation_input_tokens: data.usage?.cache_creation_input_tokens || 0,
+    cache_read_input_tokens: data.usage?.cache_read_input_tokens || 0,
+  };
+  // Sonnet pricing: $3/M input, $15/M output
+  const costUsd = (usage.input_tokens! * 3 + usage.output_tokens! * 15) / 1_000_000;
+  updateDailyUsage("_sonnet_direct", "sonnet_direct", usage, costUsd);
+
+  return { reply, fallback: isDistressResponse(reply), usage, costUsd };
+}
+
+// Last-exchange buffer per bucket for follow-up context on stateless calls
+const lastDirectExchange = new Map<string, { instruction: string; reply: string; ts: number }>();
+
+function saveDirectExchange(bucket: string, instruction: string, reply: string): void {
+  lastDirectExchange.set(bucket, { instruction: instruction.slice(0, 2000), reply: reply.slice(0, 2000), ts: Date.now() });
+}
+
+function getDirectExchange(bucket: string): string {
+  const ex = lastDirectExchange.get(bucket);
+  if (!ex || Date.now() - ex.ts > 10 * 60 * 1000) return ""; // 10 min TTL
+  return `Previous exchange in this topic:\nUser: ${ex.instruction}\nAssistant: ${ex.reply}\n\n`;
+}
+
 // Recent message history for dispatch context (ring buffer, last 5)
 const recentMessages: Array<{ ts: number; instruction: string; bucket: string; isForward: boolean }> = [];
 const MAX_RECENT = 5;
@@ -226,11 +305,13 @@ function recentContext(): string {
 type DispatchDecision = {
   bucket: string;
   model: "sonnet" | "opus";
+  simple: boolean; // true = zero-token deterministic handler, false = needs reasoning model
+  tools: boolean;  // true = needs claude -p (tool access), false = direct API is sufficient
   reasoning: string;
 };
 
 async function dispatchWithHaiku(instruction: string, isForward: boolean): Promise<DispatchDecision> {
-  const prompt = `You are a message router for a CEO's AI assistant. Route each message to the correct processing bucket and choose the right model.
+  const prompt = `You are a message router for a CEO's AI assistant. Route each message to the correct processing bucket, choose the right model, and decide what capabilities are needed.
 
 Available buckets:
 - calendar: meetings, agenda, schedule, invites, RSVPs
@@ -243,6 +324,14 @@ Model selection:
 - sonnet: default for everything — fast, cheap, good enough for most tasks
 - opus: ONLY when the user explicitly asks for deep reasoning ("use opus", "think deeply")
 
+Simple vs reasoning:
+- SIMPLE=yes: ONLY for "show me today's calendar/agenda" or "show my tasks" — a pure data lookup for TODAY with no analysis
+- SIMPLE=no: everything else
+
+Tools needed:
+- TOOLS=yes: when the task requires FETCHING data not already in the message (check calendar, read emails, look up tasks, search chat history), or WRITING files (save to notes, remember), or reading local files
+- TOOLS=no: when ALL content needed is already present in the message — forwarded emails/docs with content included, quoted messages with text included, user-provided text to summarize/translate/draft/rewrite. The key test: can this be answered using ONLY the text in the message?
+
 IMPORTANT: If the message references a recent forwarded item (e.g., "draft a reply", "translate this", "summarize it"), route to the SAME bucket as that forwarded item.
 
 Recent message history:
@@ -251,25 +340,33 @@ ${recentContext()}
 Current message${isForward ? " (forwarded content)" : ""}:
 ${instruction.slice(0, 500)}
 
-Respond in exactly this format (3 lines, no extra text):
+Respond in exactly this format (5 lines, no extra text):
 BUCKET: <bucket name>
 MODEL: <sonnet or opus>
+SIMPLE: <yes or no>
+TOOLS: <yes or no>
 REASON: <one short sentence>`;
 
   try {
-    const output = await callHaiku(prompt, 100, "_dispatch");
+    const output = await callHaiku(prompt, 140, "_dispatch");
     const bucketMatch = output.match(/BUCKET:\s*(\S+)/i);
     const modelMatch = output.match(/MODEL:\s*(\S+)/i);
+    const simpleMatch = output.match(/SIMPLE:\s*(\S+)/i);
+    const toolsMatch = output.match(/TOOLS:\s*(\S+)/i);
     const reasonMatch = output.match(/REASON:\s*(.+)/i);
 
     const bucket = bucketMatch?.[1] || "general";
     const validBuckets = ["calendar", "email", "lark_docs", "chat_history", "general"];
     const model = (modelMatch?.[1]?.toLowerCase() === "opus" ? "opus" : "sonnet") as "sonnet" | "opus";
+    const simple = simpleMatch?.[1]?.toLowerCase() === "yes";
+    const tools = toolsMatch?.[1]?.toLowerCase() !== "no"; // default to yes (conservative)
 
-    log(`haiku dispatch: ${bucket} / ${model} — ${reasonMatch?.[1]?.slice(0, 60) || "no reason"}`);
+    log(`haiku dispatch: ${bucket} / ${model} / simple=${simple} / tools=${tools} — ${reasonMatch?.[1]?.slice(0, 60) || "no reason"}`);
     return {
       bucket: validBuckets.includes(bucket) ? bucket : "general",
       model,
+      simple,
+      tools,
       reasoning: reasonMatch?.[1] || "",
     };
   } catch (err) {
@@ -291,7 +388,7 @@ function fallbackDetect(instruction: string): DispatchDecision {
     bucket = "chat_history";
   }
   const model = ["use opus", "think deeply", "deep reasoning"].some((kw) => lower.includes(kw)) ? "opus" as const : "sonnet" as const;
-  return { bucket, model, reasoning: "keyword fallback" };
+  return { bucket, model, simple: false, tools: true, reasoning: "keyword fallback" };
 }
 
 type ForwardExtract = {
@@ -409,6 +506,9 @@ async function runProcess(
     env: {
       ...process.env,
       PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+      // Strip ANTHROPIC_API_KEY from subprocesses — the claude CLI has its own auth,
+      // and inheriting this key causes "Invalid API key" errors.
+      ANTHROPIC_API_KEY: undefined as unknown as string,
     },
   });
 
@@ -484,25 +584,20 @@ async function sendReply(text: string, meta: Record<string, unknown> = {}): Prom
   throw new Error(`sendReply failed: ${lastError}`);
 }
 
-async function handleSimpleCalendar(instruction: string): Promise<string | null> {
-  const lower = instruction.toLowerCase();
-  if (!["calendar", "agenda", "meeting", "schedule"].some((kw) => lower.includes(kw))) {
-    return null;
-  }
-
+async function handleSimpleCalendar(_instruction: string): Promise<string | null> {
+  // Haiku already decided this is a simple today-only calendar lookup
   const raw = await runLarkCli(["calendar", "+agenda", "--format", "json"]);
   try {
     const data = JSON.parse(raw);
     const events = data.data || [];
     if (!events.length) return "No events on your calendar today.";
 
-    const isWeek = ["week", "this week"].some((kw) => lower.includes(kw));
-    const lines = [isWeek ? "**Your upcoming events:**\n" : "**Today's agenda:**\n"];
+    const lines = ["**Today's agenda:**\n"];
     for (const event of events) {
       const summary = event.summary || "(no title)";
       const start = event.start_time?.datetime || "";
       const end = event.end_time?.datetime || "";
-      const st = isWeek ? start.slice(5, 16).replace("T", " ") : start.slice(11, 16);
+      const st = start.slice(11, 16);
       const et = end ? end.slice(11, 16) : "";
       lines.push(`- ${st}-${et}  ${summary}`);
     }
@@ -512,10 +607,8 @@ async function handleSimpleCalendar(instruction: string): Promise<string | null>
   }
 }
 
-async function handleSimpleTasks(instruction: string): Promise<string | null> {
-  const lower = instruction.toLowerCase();
-  if (!["task", "todo", "to-do"].some((kw) => lower.includes(kw))) return null;
-
+async function handleSimpleTasks(_instruction: string): Promise<string | null> {
+  // Haiku already decided this is a simple task lookup
   const raw = await runLarkCli(["task", "+get-my-tasks", "--format", "json"]);
   try {
     const data = JSON.parse(raw);
@@ -566,7 +659,7 @@ function buildClaudePrompt(
     "",
     "Do not mention tools, internal reasoning, or session mechanics.",
     persist
-      ? "Also produce a concise markdown note suitable for appending to the daily brief."
+      ? "Also produce a concise markdown note suitable for appending to the daily brief. When saving to a file, derive the filename from the CURRENT content's topic — not from prior session history."
       : "Set save_note_markdown to null unless the user explicitly asked to save, note, or remember.",
     "If the request is ambiguous, make the best reasonable assumption and answer directly.",
     "",
@@ -972,14 +1065,14 @@ function handleInbound(instruction: string, messageId: string, isForward = false
         model,
         dispatchReason: dispatch.reasoning,
         isForward,
+        simple: dispatch.simple,
+        tools: dispatch.tools,
         compressed: processed !== instruction,
         queueAhead,
       });
 
-      // Try simple handlers first (zero-token, instant) — but skip for forwards
-      // Forwarded content often mentions "meeting"/"schedule" etc. in body text,
-      // which would falsely trigger simple calendar/task handlers
-      if (!isForward) {
+      // Try simple handlers only when Haiku explicitly says it's a simple data lookup
+      if (dispatch.simple && !isForward) {
         const simple =
           (await handleSimpleCalendar(instruction)) ??
           (await handleSimpleTasks(instruction)) ??
@@ -997,7 +1090,81 @@ function handleInbound(instruction: string, messageId: string, isForward = false
         }
       }
 
-      // Send compressed content to reasoning model (saves tokens + reduces noise)
+      // Direct Sonnet API for tool-free tasks (Phase 1)
+      if (!dispatch.tools && dispatch.model !== "opus") {
+        const priorExchange = getDirectExchange(bucket.key);
+        const memoryText = readBucketMemory(bucket.key);
+        const memoryBlock = memoryText
+          ? `Recent ${bucket.label} context:\n${memoryText.trim().slice(0, 1500)}\n\n`
+          : "";
+        const directPrompt = [
+          `You are Claude Channel, a CEO's AI assistant (bucket: ${bucket.label}).`,
+          "",
+          "Formatting rules (STRICT):",
+          "- Respond in the same language the user writes in",
+          "- Keep replies SHORT — max 10 lines for simple, max 20 for complex",
+          "- Use bullet points, NOT tables",
+          "- Bold key info: names, dates, amounts, decisions",
+          "- Lead with the answer, then supporting details",
+          "- Never say 'here is the summary' — just give the summary",
+          "",
+          memoryBlock,
+          priorExchange,
+          "User message:",
+          processed,
+        ].filter(Boolean).join("\n");
+
+        try {
+          const result = await callSonnetDirect(directPrompt);
+          if (result.fallback) {
+            // Distress detected — fall back to claude -p
+            log(`sonnet direct distress detected, falling back to claude -p: ${result.reply.slice(0, 80)}`);
+            logJson(EVENTS_FILE, {
+              type: "direct_fallback",
+              messageId,
+              bucket: bucket.key,
+              distressReply: result.reply.slice(0, 200),
+              directCostUsd: result.costUsd,
+            });
+            await handleComplex(processed, messageId, bucket, model);
+            return;
+          }
+
+          // Success — send reply, save exchange for follow-ups
+          const replyText = formatReplyForLark(result.reply);
+          saveDirectExchange(bucket.key, processed, result.reply);
+          appendBucketMemory(bucket.key, processed, {
+            reply_markdown: result.reply,
+            save_note_markdown: null,
+          });
+          await sendReply(replyText, {
+            type: "direct_sonnet",
+            messageId,
+            bucket: bucket.key,
+          });
+          logJson(EVENTS_FILE, {
+            type: "direct_complete",
+            messageId,
+            durationMs: Date.now() - start,
+            bucket: bucket.key,
+            costUsd: result.costUsd,
+            inputTokens: result.usage.input_tokens,
+            outputTokens: result.usage.output_tokens,
+          });
+          return;
+        } catch (err) {
+          log(`sonnet direct API failed, falling back to claude -p: ${err}`);
+          logJson(EVENTS_FILE, {
+            type: "direct_error",
+            messageId,
+            bucket: bucket.key,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          // Fall through to handleComplex
+        }
+      }
+
+      // Full claude -p path (tools, session resume, file access)
       await handleComplex(processed, messageId, bucket, model);
     }).catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -1037,6 +1204,42 @@ Bun.serve({
         reasoningModel: CONFIG.reasoningModel,
         maxSessionTurns: CONFIG.maxSessionTurns,
       });
+    }
+
+    // Debug endpoint: exercise the distress detection → fallback chain
+    if (req.method === "POST" && url.pathname === "/debug/test-distress") {
+      const body = (await req.json()) as any;
+      const messageId = body.messageId || `om_debug_${Date.now()}`;
+      const distressText = body.distressText || "I don't have access to that information.";
+      const bucket = bucketConfig(body.bucket || "general");
+
+      // Simulate: isDistressResponse returns true → log direct_fallback → run handleComplex
+      const detected = isDistressResponse(distressText);
+      logJson(EVENTS_FILE, {
+        type: "direct_fallback",
+        messageId,
+        bucket: bucket.key,
+        distressReply: distressText.slice(0, 200),
+        directCostUsd: 0,
+        synthetic: true,
+      });
+
+      if (detected) {
+        // Run the real claude -p fallback path
+        enqueue(bucket.key, async () => {
+          await handleComplex(
+            body.instruction || "Summarize your current capabilities and available tools.",
+            messageId,
+            bucket,
+            CONFIG.defaultModel,
+          );
+        }).catch((err) => {
+          log(`debug test-distress handleComplex error: ${err}`);
+          logJson(EVENTS_FILE, { type: "error", messageId, error: String(err) });
+        });
+      }
+
+      return Response.json({ ok: true, detected, messageId });
     }
 
     if (req.method !== "POST" || url.pathname !== "/webhook") {
@@ -1168,6 +1371,42 @@ Bun.serve({
     // Strip HTML tags from rich text content
     text = text.replace(/<[^>]+>/g, "").trim();
     if (!text) return Response.json({ ok: true });
+
+    // If this message quotes another message, fetch the quoted content and prepend it
+    const parentId = message.parent_id || "";
+    if (parentId) {
+      try {
+        const raw = await runLarkCli(["im", "+messages-mget", "--as", "bot", "--message-ids", parentId, "--format", "json"]);
+        const parsed = JSON.parse(raw);
+        const items = parsed.data?.items || parsed.items || [parsed.data].filter(Boolean);
+        if (items.length > 0) {
+          const quoted = items[0];
+          const qContent = JSON.parse(quoted.body?.content || quoted.content || "{}");
+          const qType = quoted.msg_type || quoted.message_type || "";
+          let quotedText = "";
+          if (qType === "text") {
+            quotedText = qContent.text || "";
+          } else if (qType === "post") {
+            const qLang = qContent.zh_cn || qContent.en_us || qContent[Object.keys(qContent)[0]] || {};
+            quotedText = [
+              qLang.title || "",
+              ...(qLang.content || []).flat().map((n: any) => n.text || n.content || "").filter(Boolean),
+            ].filter(Boolean).join(" ");
+          } else if (qType === "interactive") {
+            const qTitle = qContent.title || "";
+            const qBody = (qContent.elements || []).flat().map((n: any) => n.text || "").filter(Boolean).join("");
+            quotedText = [qTitle, qBody].filter(Boolean).join("\n\n");
+          }
+          quotedText = quotedText.replace(/<[^>]+>/g, "").trim();
+          if (quotedText) {
+            text = `IMPORTANT: The user is quoting a specific message. Their instruction "${text}" applies to the QUOTED CONTENT below, NOT to prior conversation history. If saving/noting, use a filename derived from the quoted content's topic.\n\n---\n\nQuoted content:\n${quotedText}\n\n---\n\nUser instruction: ${text}`;
+            log(`fetched quoted message ${parentId}: ${quotedText.slice(0, 80)}...`);
+          }
+        }
+      } catch (err) {
+        log(`failed to fetch quoted message ${parentId}: ${err}`);
+      }
+    }
 
     // Determine if this should be buffered (forwarded content, URL-only messages)
     const isUrlOnly = messageType === "text" && /^\s*https?:\/\/\S+\s*$/.test(text);
