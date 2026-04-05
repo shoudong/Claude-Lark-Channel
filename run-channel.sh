@@ -11,5 +11,5 @@ set -a
 source "$ENV_FILE"
 set +a
 
-cd "$HOME/Claude/scripts/lark-channel"
-exec /opt/homebrew/bin/bun server.ts
+cd "$(dirname "$0")"
+exec bun server.ts

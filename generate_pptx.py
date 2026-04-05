@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate Claude Channel Setup Guide presentation for ADVANCE.AI leadership.
+Generate Claude Channel Setup Guide presentation for your organization's leadership.
 """
 
 from pptx import Presentation
@@ -11,7 +11,7 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.oxml.ns import qn
 
 # === Constants ===
-OUTPUT_PATH = "/Users/dong-ai/Documents/ADVANCE-AI-OS/09_Speeches_Writing/Claude-Channel-Setup-Guide.pptx"
+OUTPUT_PATH = "./Claude-Channel-Setup-Guide.pptx"
 
 # Colors
 DARK_BLUE = RGBColor(0x1A, 0x36, 0x5D)
@@ -59,7 +59,7 @@ def create_presentation():
             "Simple tasks (calendar, tasks, email) -- instant, zero AI cost",
             "Complex tasks (analysis, drafting, summarization) -- full AI power",
             "Works from any device with Lark (phone, desktop, web)",
-            "Replaces unreliable automation tools (OpenClaw)",
+            "Replaces unreliable automation tools",
         ],
     )
 
@@ -172,7 +172,7 @@ def add_footer_bar(slide):
     add_textbox(
         slide, Inches(0.7), Inches(7.15),
         Inches(5), Inches(0.3),
-        "ADVANCE.AI  |  Claude Channel Setup Guide  |  April 2026",
+        "Your Company  |  Claude Channel Setup Guide  |  April 2026",
         size=9, color=GRAY,
     )
 
@@ -316,7 +316,7 @@ def add_title_slide(slide):
     add_textbox(
         slide, Inches(1.2), Inches(4.7),
         Inches(10), Inches(0.5),
-        "Setup Guide for ADVANCE.AI Leadership Team",
+        "Setup Guide for Leadership Team",
         size=18, color=RGBColor(0xCB, 0xD5, 0xE0),
     )
 
@@ -331,7 +331,7 @@ def add_title_slide(slide):
     add_textbox(
         slide, Inches(1.2), Inches(6.0),
         Inches(4), Inches(0.4),
-        "Dong Shou",
+        "Your Name",
         size=14, color=RGBColor(0x90, 0xA0, 0xB0), bold=True,
     )
 
@@ -523,8 +523,8 @@ def add_complex_tasks_slide(slide):
 
     examples = [
         '"summarize my week from March 30 to today and save"',
-        '"draft a reply to Sean about the Q2 pipeline"',
-        '"analyze the Indonesia MMR data and note key takeaways"',
+        '"draft a reply to Alex about the Q2 pipeline"',
+        '"analyze the quarterly report data and note key takeaways"',
     ]
 
     for i, cmd in enumerate(examples):
@@ -863,7 +863,7 @@ def add_whats_next_slide(slide):
         "Potential to extend: add more Lark event types (doc updates, approval flows)",
         "Multi-user support: each leader gets their own Claude Channel",
         "Obsidian vault as shared team knowledge base",
-        "Vision: Every ADVANCE.AI leader has an AI assistant in their pocket via Lark",
+        "Vision: Every leader has an AI assistant in their pocket via Lark",
     ]
 
     txBox = slide.shapes.add_textbox(Inches(0.9), Inches(1.5), Inches(11), Inches(4.5))
@@ -939,14 +939,14 @@ def add_thank_you_slide(slide):
     add_textbox(
         slide, Inches(1), Inches(5.5),
         Inches(11.3), Inches(0.4),
-        "Dong Shou", size=15, bold=True,
+        "Your Name", size=15, bold=True,
         color=RGBColor(0xCB, 0xD5, 0xE0), alignment=PP_ALIGN.CENTER,
     )
 
     add_textbox(
         slide, Inches(1), Inches(5.9),
         Inches(11.3), Inches(0.4),
-        "shoudong@advancegroup.com", size=13,
+        "you@example.com", size=13,
         color=RGBColor(0x90, 0xA0, 0xB0), alignment=PP_ALIGN.CENTER,
     )
 

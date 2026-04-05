@@ -15,14 +15,14 @@
 import { readFileSync } from "node:fs";
 
 const SERVER = process.env.TEST_SERVER ?? "http://localhost:8765";
-const STATE_DIR = process.env.STATE_DIR ?? "/Users/dong-ai/Claude/scripts/lark-channel/.state";
+const STATE_DIR = process.env.STATE_DIR ?? "./.state";
 const EVENTS_FILE = `${STATE_DIR}/events.jsonl`;
 const QUICK = process.argv.includes("--quick");
 
 // --- Config matching server ---
-const CHAT_ID = "oc_cebe1616ba27d536286b15f59f63e5f0";
-const OWNER_OPEN_ID = "ou_aa8bb5691e59fce13b80cefab30df7ab";
-const VERIFICATION_TOKEN = "PxYMPKRiKPy0Q35ZKxF1DcB4MzczZXVY";
+const CHAT_ID = process.env.LARK_CHAT_ID ?? "oc_test_chat_000000000000000000000000";
+const OWNER_OPEN_ID = process.env.LARK_OWNER_OPEN_ID ?? "ou_test_owner_00000000000000000000000";
+const VERIFICATION_TOKEN = process.env.LARK_VERIFICATION_TOKEN ?? "TestVerificationTokenPlaceholder00";
 
 let testsPassed = 0;
 let testsFailed = 0;
@@ -235,12 +235,12 @@ async function testForwardedEmailExtraction() {
   console.log("\n🔹 Test: Forwarded email gets Haiku extraction (check instruction is compressed)");
   const msgId = makeMessageId();
   const ts = new Date().toISOString();
-  const longEmail = `Dear Mr. Shou,
+  const longEmail = `Dear Mr. Zhang,
 
-I hope this email finds you well. I am writing to follow up on our previous discussion regarding the Q2 partnership agreement between ADVANCE.AI and TechCorp Solutions.
+I hope this email finds you well. I am writing to follow up on our previous discussion regarding the Q2 partnership agreement between Acme Corp and GlobalTech Solutions.
 
 As discussed during our meeting on March 15th, the key terms are:
-1. Revenue share: 70/30 split favoring ADVANCE.AI
+1. Revenue share: 70/30 split favoring Acme Corp
 2. Integration timeline: 6 weeks starting April 15
 3. Minimum guarantee: USD 500,000 per quarter
 4. Termination clause: 90-day notice required
@@ -248,17 +248,17 @@ As discussed during our meeting on March 15th, the key terms are:
 Please review the attached draft agreement and let us know if you have any questions or proposed modifications by April 10th.
 
 Best regards,
-Sarah Chen
+Jane Smith
 VP of Partnerships
-TechCorp Solutions
-Level 35, Marina Bay Financial Centre
-1 Raffles Quay, Singapore 048583
-Tel: +65 6123 4567 | Fax: +65 6123 4568
+GlobalTech Solutions
+Level 35, One Example Tower
+123 Demo Street, Singapore 048583
+Tel: +65 6000 0000 | Fax: +65 6000 0001
 CONFIDENTIALITY NOTICE: This email and any attachments are for the exclusive and confidential use of the intended recipient.
 If you are not the intended recipient, please do not read, distribute, or take action based on this message.`;
 
   const payload = buildWebhookPayload(msgId, "interactive", {
-    title: "Fwd: Q2 Partnership Agreement - TechCorp",
+    title: "Fwd: Q2 Partnership Agreement - GlobalTech",
     elements: [{ text: longEmail }],
   });
   await sendWebhook(payload);

@@ -50,7 +50,7 @@ curl -s 'http://127.0.0.1:4040/api/requests/http?limit=5'
 
 ### 6. Reply test
 ```bash
-/opt/homebrew/bin/lark-cli im +messages-send --as bot --chat-id "oc_cebe1616ba27d536286b15f59f63e5f0" --markdown "Health check: Claude channel is connected."
+lark-cli im +messages-send --as bot --chat-id "$LARK_CHAT_ID" --markdown "Health check: Claude channel is connected."
 ```
 - Confirm reply was sent
 
@@ -77,7 +77,7 @@ Remind user this runs in foreground — suggest running in a separate terminal o
 
 Send a test reply to the Claude Channel:
 ```bash
-/opt/homebrew/bin/lark-cli im +messages-send --as bot --chat-id "oc_cebe1616ba27d536286b15f59f63e5f0" --markdown "Test from Claude: channel is working."
+lark-cli im +messages-send --as bot --chat-id "$LARK_CHAT_ID" --markdown "Test from Claude: channel is working."
 ```
 
 ## Implementation Notes

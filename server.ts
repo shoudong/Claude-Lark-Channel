@@ -44,12 +44,12 @@ const CONFIG = {
   larkCli: process.env.LARK_CLI ?? "/opt/homebrew/bin/lark-cli",
   claudeCli: process.env.CLAUDE_CLI ?? "/opt/homebrew/bin/claude",
   port: Number(process.env.PORT ?? "8765"),
-  claudeWorkdir: process.env.CLAUDE_WORKDIR ?? "/Users/dong-ai/Claude",
-  obsidianRoot: process.env.OBSIDIAN_ROOT ?? "/Users/dong-ai/Documents/ADVANCE-AI-OS",
+  claudeWorkdir: process.env.CLAUDE_WORKDIR ?? ".",
+  obsidianRoot: process.env.OBSIDIAN_ROOT ?? "./obsidian-vault",
   dailyBriefDir:
-    process.env.DAILY_BRIEF_DIR ?? "/Users/dong-ai/Documents/ADVANCE-AI-OS/10_Inbox",
+    process.env.DAILY_BRIEF_DIR ?? "./obsidian-vault/Inbox",
   stateDir:
-    process.env.LARK_CHANNEL_STATE_DIR ?? "/Users/dong-ai/Claude/scripts/lark-channel/.state",
+    process.env.LARK_CHANNEL_STATE_DIR ?? "./.state",
   routeMode: process.env.LARK_ROUTE_MODE ?? "claude_direct",
   defaultModel: process.env.CLAUDE_MODEL_DEFAULT ?? process.env.CLAUDE_MODEL ?? "sonnet",
   reasoningModel: process.env.CLAUDE_MODEL_REASONING ?? "opus",

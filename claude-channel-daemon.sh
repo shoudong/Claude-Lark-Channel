@@ -1,11 +1,11 @@
 #!/bin/bash
 # Claude Channel Daemon
-# Polls Lark every 15s for new messages from Dong.
+# Polls Lark every 15s for new messages from the owner.
 # Writes to /tmp/claude_channel_inbox.json ONLY when new messages arrive.
 # Designed to run as a launchd service. Zero token cost.
 
-CHAT_ID="oc_cebe1616ba27d536286b15f59f63e5f0"
-DONG_ID="ou_aa8bb5691e59fce13b80cefab30df7ab"
+CHAT_ID="${LARK_CHAT_ID:?Set LARK_CHAT_ID}"
+OWNER_ID="${LARK_OWNER_OPEN_ID:?Set LARK_OWNER_OPEN_ID}"
 STATE_FILE="/tmp/claude_channel_last_processed.txt"
 INBOX_FILE="/tmp/claude_channel_inbox.json"
 LOG_FILE="/tmp/claude_channel_daemon.log"
@@ -39,7 +39,7 @@ while true; do
         continue
     fi
 
-    # Extract new messages from Dong
+    # Extract new messages from the owner
     NEW_MSG=$(echo "$MESSAGES" | python3 -c "
 import json, sys
 try:
@@ -52,7 +52,7 @@ try:
         if msg['message_id'] == last:
             found_last = True
             continue
-        if found_last and msg.get('sender', {}).get('id') == '$DONG_ID' and msg.get('msg_type') != 'system':
+        if found_last and msg.get('sender', {}).get('id') == '$OWNER_ID' and msg.get('msg_type') != 'system':
             new_msgs.append({
                 'id': msg['message_id'],
                 'content': msg.get('content', ''),
