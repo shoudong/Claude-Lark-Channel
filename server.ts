@@ -56,7 +56,8 @@ const CONFIG = {
   haikuModel: process.env.CLAUDE_MODEL_HAIKU ?? "claude-haiku-4-5-20251001",
   claudePermissionMode: process.env.CLAUDE_PERMISSION_MODE ?? "dontAsk",
   bucketMemoryTailChars: Number(process.env.LARK_BUCKET_MEMORY_TAIL_CHARS ?? "4000"),
-  maxSessionTurns: Number(process.env.LARK_MAX_SESSION_TURNS ?? "8"),
+  maxSessionTurns: Number(process.env.LARK_MAX_SESSION_TURNS ?? "16"),
+  sessionStaleMs: Number(process.env.LARK_SESSION_STALE_MS ?? String(60 * 60 * 1000)), // 1 hour
 };
 
 const SESSION_FILE = join(CONFIG.stateDir, "sessions.json");
@@ -722,7 +723,10 @@ async function runClaude(
   const state = loadSessionState();
   const key = sessionStateKey(bucket.key);
   const current = state[key];
-  const existing = current && current.turns < CONFIG.maxSessionTurns ? current : undefined;
+  const isStale = current?.updatedAt
+    ? Date.now() - new Date(current.updatedAt).getTime() > CONFIG.sessionStaleMs
+    : false;
+  const existing = current && current.turns < CONFIG.maxSessionTurns && !isStale ? current : undefined;
   const persist = shouldPersist(instruction);
   const memoryText = existing?.sessionId ? "" : readBucketMemory(bucket.key);
 
@@ -732,7 +736,7 @@ async function runClaude(
     logJson(EVENTS_FILE, {
       type: "session_rotated",
       bucket: bucket.key,
-      reason: "max_turns",
+      reason: isStale ? "stale" : "max_turns",
       priorTurns: current.turns,
     });
   }
@@ -749,7 +753,7 @@ async function runClaude(
     "--model",
     model,
     "--add-dir",
-    CONFIG.obsidianRoot,
+    BUCKET_MEMORY_DIR,
   ];
 
   if (existing?.sessionId) {
