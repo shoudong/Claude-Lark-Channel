@@ -328,9 +328,9 @@ Simple vs reasoning:
 - SIMPLE=yes: ONLY for "show me today's calendar/agenda" or "show my tasks" — a pure data lookup for TODAY with no analysis
 - SIMPLE=no: everything else
 
-Tools needed:
-- TOOLS=yes: when the task requires FETCHING data not already in the message (check calendar, read emails, look up tasks, search chat history), or WRITING files (save to notes, remember), or reading local files
-- TOOLS=no: when ALL content needed is already present in the message — forwarded emails/docs with content included, quoted messages with text included, user-provided text to summarize/translate/draft/rewrite. The key test: can this be answered using ONLY the text in the message?
+Tools needed (DEFAULT IS YES — only say no when you are certain):
+- TOOLS=yes: DEFAULT. Use for anything that might need external data, file access, or actions. This includes: checking calendar, reading emails, looking up tasks, searching chat, saving/writing files, reading documents, sending messages, opening links, any ambiguous request.
+- TOOLS=no: ONLY when ALL three conditions are met: (1) ALL content needed is already present in the message text, (2) the task is purely text manipulation (summarize, translate, rewrite, draft, explain, analyze text), and (3) no file read/write/save/send/check/fetch/open/search is needed. When in doubt, say TOOLS=yes.
 
 IMPORTANT: If the message references a recent forwarded item (e.g., "draft a reply", "translate this", "summarize it"), route to the SAME bucket as that forwarded item.
 
@@ -492,6 +492,25 @@ function bucketConfig(key: string): BucketConfig {
 
 function shouldPersist(instruction: string): boolean {
   return ["save", "note", "remember"].some((kw) => instruction.toLowerCase().includes(kw));
+}
+
+const TOOL_KEYWORDS = [
+  // file ops
+  "save", "note", "remember", "read", "open", "write", "create", "delete",
+  // data fetching
+  "check", "fetch", "search", "find", "look up", "lookup", "show me", "get my",
+  // actions
+  "send", "reply", "forward", "schedule", "book", "cancel", "move", "reschedule",
+  // data sources
+  "calendar", "email", "inbox", "mail", "task", "chat history", "messages",
+  // Chinese equivalents
+  "保存", "记住", "读", "打开", "查", "检查", "搜索", "找", "发送", "回复",
+  "日历", "邮件", "邮箱", "任务", "日程",
+];
+
+function needsTools(instruction: string): boolean {
+  const lower = instruction.toLowerCase();
+  return TOOL_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
 async function runProcess(
@@ -659,7 +678,16 @@ function buildClaudePrompt(
     "",
     "Do not mention tools, internal reasoning, or session mechanics.",
     persist
-      ? "Also produce a concise markdown note suitable for appending to the daily brief. When saving to a file, derive the filename from the CURRENT content's topic — not from prior session history."
+      ? [
+          "The user wants to SAVE content. Follow these rules:",
+          `- Obsidian bucket memory directory: ${BUCKET_MEMORY_DIR}`,
+          "- If the user specifies a bucket name (e.g. 'save to bucket named Accident'), create or append to that file: <bucket_memory_dir>/<BucketName>.md",
+          "- Save the FULL quoted/forwarded content — do NOT summarize or translate it. Preserve the original language.",
+          "- Add a timestamp header (## YYYY-MM-DD HH:MM) before each entry",
+          "- After saving the file, confirm with the file path and a 1-line summary of what was saved",
+          "- Also set save_note_markdown to a concise summary for the daily brief",
+          "- Derive filenames from the CURRENT content's topic — not from prior session history",
+        ].join("\n")
       : "Set save_note_markdown to null unless the user explicitly asked to save, note, or remember.",
     "If the request is ambiguous, make the best reasonable assumption and answer directly.",
     "",
@@ -1047,6 +1075,11 @@ function handleInbound(instruction: string, messageId: string, isForward = false
 
     // Haiku decides bucket + model (~300-800ms via direct API)
     const dispatch = await dispatchWithHaiku(processed, isForward);
+    // Force tools=true when instruction clearly needs tool access
+    // This overrides Haiku misclassifying tools=false for action-oriented requests
+    if (needsTools(instruction)) {
+      dispatch.tools = true;
+    }
     const bucket = bucketConfig(dispatch.bucket);
     const model = dispatch.model === "opus" ? CONFIG.reasoningModel : CONFIG.defaultModel;
 
@@ -1280,6 +1313,12 @@ Bun.serve({
     const messageId = message.message_id || "";
     const messageType = message.message_type || "";
 
+    // Log all message fields for debugging quote issues
+    const msgKeys = Object.keys(message).sort().join(",");
+    if (message.parent_id || message.upper_message_id || message.root_id) {
+      log(`msg fields with refs: ${msgKeys} | parent_id=${message.parent_id || ""} upper_message_id=${message.upper_message_id || ""} root_id=${message.root_id || ""}`);
+    }
+
     if (senderId !== CONFIG.ownerOpenId) return Response.json({ ok: true });
     if (chatId !== CONFIG.chatId) return Response.json({ ok: true });
     if (!messageId || isDuplicate(messageId)) return Response.json({ ok: true });
@@ -1373,35 +1412,60 @@ Bun.serve({
     if (!text) return Response.json({ ok: true });
 
     // If this message quotes another message, fetch the quoted content and prepend it
-    const parentId = message.parent_id || "";
+    // Lark uses different fields: parent_id for thread replies, upper_message_id for "引用" (quote)
+    const parentId = message.upper_message_id || message.parent_id || "";
     if (parentId) {
+      log(`quote detected: upper_message_id=${message.upper_message_id || "(none)"} parent_id=${message.parent_id || "(none)"} → fetching ${parentId}`);
       try {
         const raw = await runLarkCli(["im", "+messages-mget", "--as", "bot", "--message-ids", parentId, "--format", "json"]);
         const parsed = JSON.parse(raw);
-        const items = parsed.data?.items || parsed.items || [parsed.data].filter(Boolean);
+        const items = parsed.data?.messages || parsed.data?.items || parsed.items || [parsed.data].filter(Boolean);
         if (items.length > 0) {
           const quoted = items[0];
-          const qContent = JSON.parse(quoted.body?.content || quoted.content || "{}");
+          const rawContent = quoted.body?.content || quoted.content || "";
           const qType = quoted.msg_type || quoted.message_type || "";
+          log(`quoted msg type=${qType}, content preview=${String(rawContent).slice(0, 120)}`);
           let quotedText = "";
-          if (qType === "text") {
-            quotedText = qContent.text || "";
-          } else if (qType === "post") {
-            const qLang = qContent.zh_cn || qContent.en_us || qContent[Object.keys(qContent)[0]] || {};
-            quotedText = [
-              qLang.title || "",
-              ...(qLang.content || []).flat().map((n: any) => n.text || n.content || "").filter(Boolean),
-            ].filter(Boolean).join(" ");
-          } else if (qType === "interactive") {
-            const qTitle = qContent.title || "";
-            const qBody = (qContent.elements || []).flat().map((n: any) => n.text || "").filter(Boolean).join("");
-            quotedText = [qTitle, qBody].filter(Boolean).join("\n\n");
+
+          // Try JSON parse first (webhook-style content), fall back to plain text (lark-cli style)
+          let qContent: any = {};
+          try {
+            qContent = JSON.parse(rawContent);
+          } catch {
+            // lark-cli returns plain text content for bot messages — use directly
+            quotedText = String(rawContent).trim();
           }
+
+          if (!quotedText) {
+            if (qType === "text") {
+              quotedText = qContent.text || "";
+            } else if (qType === "post") {
+              const qLang = qContent.zh_cn || qContent.en_us || qContent[Object.keys(qContent)[0]] || {};
+              if (typeof qLang === "string") {
+                // lark-cli may flatten post content to a string
+                quotedText = qLang;
+              } else {
+                quotedText = [
+                  qLang.title || "",
+                  ...(qLang.content || []).flat().map((n: any) => n.text || n.content || "").filter(Boolean),
+                ].filter(Boolean).join(" ");
+              }
+            } else if (qType === "interactive") {
+              const qTitle = qContent.title || "";
+              const qBody = (qContent.elements || []).flat().map((n: any) => n.text || "").filter(Boolean).join("");
+              quotedText = [qTitle, qBody].filter(Boolean).join("\n\n");
+            }
+          }
+
           quotedText = quotedText.replace(/<[^>]+>/g, "").trim();
           if (quotedText) {
             text = `IMPORTANT: The user is quoting a specific message. Their instruction "${text}" applies to the QUOTED CONTENT below, NOT to prior conversation history. If saving/noting, use a filename derived from the quoted content's topic.\n\n---\n\nQuoted content:\n${quotedText}\n\n---\n\nUser instruction: ${text}`;
             log(`fetched quoted message ${parentId}: ${quotedText.slice(0, 80)}...`);
+          } else {
+            log(`quoted message ${parentId} had empty content after extraction (type=${qType})`);
           }
+        } else {
+          log(`quoted message ${parentId} not found (0 items returned)`);
         }
       } catch (err) {
         log(`failed to fetch quoted message ${parentId}: ${err}`);
