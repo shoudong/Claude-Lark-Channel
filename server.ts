@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { mkdirSync, existsSync, readFileSync, appendFileSync, writeFileSync, statSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, appendFileSync, writeFileSync, statSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 type SessionInfo = {
@@ -41,8 +41,8 @@ const CONFIG = {
   ownerOpenId: requireEnv("LARK_OWNER_OPEN_ID"),
   verificationToken: requireEnv("LARK_VERIFICATION_TOKEN"),
   anthropicApiKey: requireEnv("ANTHROPIC_API_KEY"),
-  larkCli: process.env.LARK_CLI ?? "/opt/homebrew/bin/lark-cli",
-  claudeCli: process.env.CLAUDE_CLI ?? "/opt/homebrew/bin/claude",
+  larkCli: process.env.LARK_CLI ?? "lark-cli",
+  claudeCli: process.env.CLAUDE_CLI ?? "claude",
   port: Number(process.env.PORT ?? "8765"),
   claudeWorkdir: process.env.CLAUDE_WORKDIR ?? ".",
   obsidianRoot: process.env.OBSIDIAN_ROOT ?? "./obsidian-vault",
@@ -210,6 +210,7 @@ async function callHaiku(prompt: string, maxTokens = 300, purpose = "haiku"): Pr
 // --- Direct Sonnet API for tool-free tasks ---
 
 const DISTRESS_SIGNALS = [
+  // English
   "i don't have access",
   "i can't see",
   "i cannot see",
@@ -226,6 +227,19 @@ const DISTRESS_SIGNALS = [
   "please paste",
   "please provide the",
   "not visible in this conversation",
+  // Chinese
+  "我无法访问",
+  "我看不到",
+  "我无法看到",
+  "请提供",
+  "请分享",
+  "请粘贴",
+  "没有看到内容",
+  "没有邮件内容",
+  "没有文档内容",
+  "无法获取",
+  "我没有权限",
+  "内容不可见",
 ];
 
 function isDistressResponse(text: string): boolean {
@@ -378,16 +392,16 @@ REASON: <one short sentence>`;
 function fallbackDetect(instruction: string): DispatchDecision {
   const lower = instruction.toLowerCase();
   let bucket = "general";
-  if (["calendar", "agenda", "meeting", "schedule", "invite", "rsvp"].some((kw) => lower.includes(kw))) {
+  if (["calendar", "agenda", "meeting", "schedule", "invite", "rsvp", "日历", "会议", "日程", "议程", "邀请", "排期"].some((kw) => lower.includes(kw))) {
     bucket = "calendar";
-  } else if (["email", "mail", "inbox", "reply to email", "gmail"].some((kw) => lower.includes(kw))) {
+  } else if (["email", "mail", "inbox", "reply to email", "gmail", "邮件", "邮箱", "收件箱", "回复邮件"].some((kw) => lower.includes(kw))) {
     bucket = "email";
-  } else if (["doc", "docs", "document", "wiki", "knowledge base"].some((kw) => lower.includes(kw))) {
+  } else if (["doc", "docs", "document", "wiki", "knowledge base", "文档", "知识库", "wiki", "飞书文档"].some((kw) => lower.includes(kw))) {
     bucket = "lark_docs";
-  } else if (["chat history", "im messages", "conversation", "thread", "messages", "chat log"].some((kw) => lower.includes(kw))) {
+  } else if (["chat history", "im messages", "conversation", "thread", "messages", "chat log", "聊天记录", "消息", "对话", "聊天", "消息记录"].some((kw) => lower.includes(kw))) {
     bucket = "chat_history";
   }
-  const model = ["use opus", "think deeply", "deep reasoning"].some((kw) => lower.includes(kw)) ? "opus" as const : "sonnet" as const;
+  const model = ["use opus", "think deeply", "deep reasoning", "深度思考", "仔细想", "用opus"].some((kw) => lower.includes(kw)) ? "opus" as const : "sonnet" as const;
   return { bucket, model, simple: false, tools: true, reasoning: "keyword fallback" };
 }
 
@@ -448,7 +462,7 @@ ${content.slice(0, 4000)}`;
   }
 }
 
-const LONG_CONTENT_THRESHOLD = 500;
+const LONG_CONTENT_THRESHOLD = 800;
 
 async function extractLongContent(content: string): Promise<string> {
   const prompt = `You are a pre-processor for a CEO's AI assistant. You receive a long message and your job is to compress it into the essential information only.
@@ -490,8 +504,19 @@ function bucketConfig(key: string): BucketConfig {
 }
 
 
+function listVaultBuckets(): string[] {
+  try {
+    return readdirSync(CONFIG.obsidianRoot, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith("."))
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 function shouldPersist(instruction: string): boolean {
-  return ["save", "note", "remember"].some((kw) => instruction.toLowerCase().includes(kw));
+  return ["save", "note", "remember", "保存", "记录", "记住", "存", "笔记"].some((kw) => instruction.toLowerCase().includes(kw));
 }
 
 const TOOL_KEYWORDS = [
@@ -503,9 +528,16 @@ const TOOL_KEYWORDS = [
   "send", "reply", "forward", "schedule", "book", "cancel", "move", "reschedule",
   // data sources
   "calendar", "email", "inbox", "mail", "task", "chat history", "messages",
-  // Chinese equivalents
-  "保存", "记住", "读", "打开", "查", "检查", "搜索", "找", "发送", "回复",
-  "日历", "邮件", "邮箱", "任务", "日程",
+  // Chinese — file ops
+  "保存", "记住", "记录", "笔记", "读", "打开", "写", "创建", "删除", "存",
+  // Chinese — data fetching
+  "查", "检查", "搜索", "找", "查看", "获取", "看看",
+  // Chinese — actions
+  "发送", "回复", "转发", "预约", "取消", "移动", "改期", "下载", "上传",
+  // Chinese — data sources
+  "日历", "邮件", "邮箱", "任务", "日程", "聊天记录", "消息", "文档",
+  // Chinese — analysis/summary that may need data
+  "总结", "汇总", "分析", "整理",
 ];
 
 function needsTools(instruction: string): boolean {
@@ -524,7 +556,7 @@ async function runProcess(
     stderr: "pipe",
     env: {
       ...process.env,
-      PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+      PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
       // Strip ANTHROPIC_API_KEY from subprocesses — the claude CLI has its own auth,
       // and inheriting this key causes "Invalid API key" errors.
       ANTHROPIC_API_KEY: undefined as unknown as string,
@@ -680,13 +712,18 @@ function buildClaudePrompt(
     persist
       ? [
           "The user wants to SAVE content. Follow these rules:",
-          `- Obsidian bucket memory directory: ${BUCKET_MEMORY_DIR}`,
-          "- If the user specifies a bucket name (e.g. 'save to bucket named Accident'), create or append to that file: <bucket_memory_dir>/<BucketName>.md",
+          `- Obsidian vault root: ${CONFIG.obsidianRoot}`,
+          `- Existing vault folders (buckets): ${listVaultBuckets().join(", ")}`,
+          "- When the user says 'save to bucket named X', find the matching folder by keyword:",
+          "  e.g. 'Accident' → 11_Accidents, 'Strategy' → 01_Strategy, 'Product' → 02_Product, etc.",
+          `  Save the file there: ${CONFIG.obsidianRoot}/<matching_folder>/<TopicName>.md`,
+          "- If no folder matches, create a new numbered one (next available number) under the vault root",
+          `- Do NOT save to ${BUCKET_MEMORY_DIR} — that is for channel session memory, not user-requested saves`,
           "- Save the FULL quoted/forwarded content — do NOT summarize or translate it. Preserve the original language.",
           "- Add a timestamp header (## YYYY-MM-DD HH:MM) before each entry",
-          "- After saving the file, confirm with the file path and a 1-line summary of what was saved",
-          "- Also set save_note_markdown to a concise summary for the daily brief",
           "- Derive filenames from the CURRENT content's topic — not from prior session history",
+          "- After saving, confirm with the file path and a 1-line summary",
+          "- Also set save_note_markdown to a concise summary for the daily brief",
         ].join("\n")
       : "Set save_note_markdown to null unless the user explicitly asked to save, note, or remember.",
     "If the request is ambiguous, make the best reasonable assumption and answer directly.",
@@ -1474,7 +1511,7 @@ Bun.serve({
 
     // Determine if this should be buffered (forwarded content, URL-only messages)
     const isUrlOnly = messageType === "text" && /^\s*https?:\/\/\S+\s*$/.test(text);
-    const shouldBuffer = messageType === "interactive" || messageType === "post" || messageType === "file" || messageType === "image" || isUrlOnly;
+    const shouldBuffer = messageType === "interactive" || messageType === "post" || messageType === "file" || messageType === "image" || messageType === "merge_forward" || isUrlOnly;
 
     if (shouldBuffer) {
       // Forwarded content, file, image, or URL — buffer and wait for follow-up instruction
