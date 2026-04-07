@@ -209,7 +209,7 @@ npm install -g @anthropic-ai/claude-code
 claude --version
 ```
 
-You'll need an Anthropic API key or Claude Pro/Max subscription for Claude Code to work.
+You'll need an Anthropic API key or Claude Pro/Max subscription for Claude Code to work. See the **1Password** section below for secure key management.
 
 ### 6. ngrok (exposes local server to the internet for Lark webhooks)
 
@@ -241,6 +241,29 @@ YourVault/
 ├── 10_Inbox/            # Capture area — Lark summaries go here
 │   └── Lark-Channel-Memory/  # Auto-created by the channel server
 └── Shared/              # Cross-vault shared context files
+```
+
+### 8. API key management (1Password recommended)
+
+This project requires an **Anthropic API key** (for Haiku dispatch) and **Lark app credentials**. You have two options:
+
+**Option A: 1Password (recommended)** — store secrets in 1Password and reference them in your config using the [1Password CLI](https://developer.1password.com/docs/cli/):
+
+```bash
+brew install --cask 1password-cli
+op --version
+
+# Store your keys in a 1Password vault, then reference them:
+export ANTHROPIC_API_KEY=$(op read "op://Private/Anthropic API Key/credential")
+export LARK_VERIFICATION_TOKEN=$(op read "op://Private/Lark Channel/verification-token")
+```
+
+This way, secrets never sit in plain-text config files on disk.
+
+**Option B: Environment file** — store secrets in `~/.config/claude-lark-channel/config.env` (see [Configuration](#configuration)). Make sure the file is not committed to git and has restricted permissions:
+
+```bash
+chmod 600 ~/.config/claude-lark-channel/config.env
 ```
 
 ---
