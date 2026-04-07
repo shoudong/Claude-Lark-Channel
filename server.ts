@@ -309,7 +309,7 @@ Model selection:
 - opus: ONLY when the user explicitly asks for deep reasoning ("use opus", "think deeply")
 
 Simple vs reasoning:
-- SIMPLE=yes: Pure data lookups with no analysis needed — e.g. "show today's calendar", "show tomorrow's agenda", "what meetings do I have on Friday", "show my tasks", "what's on my schedule next week"
+- SIMPLE=yes: Pure data lookups with no analysis needed — e.g. "show today's calendar", "show tomorrow's agenda", "what meetings do I have on Friday", "show my tasks", "what's on my schedule next week", "who is Peter?", "find Agnes", "what meetings yesterday?"
 - SIMPLE=no: anything requiring reasoning, composition, multi-step actions, or analysis
 
 Tools needed (DEFAULT IS YES — only say no when you are certain):
@@ -600,6 +600,26 @@ async function fetchLarkDoc(url: string): Promise<string | null> {
   }
 }
 
+async function fetchMeetingNotes(minuteToken: string): Promise<string | null> {
+  try {
+    const result = await runProcess(
+      [CONFIG.larkCli, "vc", "+notes", "--minute-tokens", minuteToken, "--format", "json"],
+      { timeoutMs: 15_000 }
+    );
+    if (result.code !== 0) {
+      log(`vc +notes failed (code ${result.code}): ${result.stderr.slice(0, 200)}`);
+      return null;
+    }
+    const data = JSON.parse(result.stdout);
+    const noteDocToken = data.data?.notes?.[0]?.note_doc_token;
+    if (!noteDocToken) { log("vc +notes: no note_doc_token found"); return null; }
+    return fetchLarkDoc(noteDocToken);
+  } catch (err) {
+    log(`meeting notes fetch error: ${err}`);
+    return null;
+  }
+}
+
 async function sendReply(text: string, meta: Record<string, unknown> = {}): Promise<void> {
   const args = [
     "im",
@@ -757,6 +777,62 @@ async function handleSimpleEmail(): Promise<string | null> {
   }
 }
 
+function extractContactQuery(text: string): string {
+  return text
+    .replace(/^(who is|find|search for|look up|查一下|谁是|找)\s*/i, "")
+    .replace(/[?.!？。！]+$/, "")
+    .trim();
+}
+
+async function handleSimpleContactSearch(query: string): Promise<string | null> {
+  if (!query) return null;
+  const raw = await runLarkCli(["contact", "+search-user", "--query", query, "--format", "json"]);
+  try {
+    const data = JSON.parse(raw);
+    const users = data.data?.users || [];
+    if (!users.length) return `**No results for "${query}".**`;
+    const lines = [`**People matching "${query}":**\n`];
+    for (const u of users.slice(0, 8)) {
+      const name = u.name || "(unknown)";
+      const uid = u.user_id || "";
+      lines.push(`- **${name}**${uid ? ` (${uid})` : ""}`);
+    }
+    return lines.join("\n");
+  } catch { return null; }
+}
+
+async function handleSimpleMeetingSearch(dateStart?: string, dateEnd?: string): Promise<string | null> {
+  const args = ["vc", "+search", "--format", "json"];
+  if (dateStart) args.push("--start", dateStart);
+  if (dateEnd) args.push("--end", dateEnd);
+  const raw = await runLarkCli(args);
+  try {
+    const data = JSON.parse(raw);
+    const items = data.data?.items || [];
+    if (!items.length) return dateStart
+      ? `**No meetings found ${dateStart}${dateEnd && dateEnd !== dateStart ? ` — ${dateEnd}` : ""}.**`
+      : "**No recent meetings found.**";
+
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    let label: string;
+    if (!dateStart) label = "Recent meetings";
+    else if (dateStart === dateEnd || !dateEnd)
+      label = dateStart === today ? "Today's meetings" : dateStart === yesterday ? "Yesterday's meetings" : `Meetings on ${dateStart}`;
+    else label = `Meetings ${dateStart} — ${dateEnd}`;
+
+    const lines = [`**${label}:**\n`];
+    for (const m of items) {
+      const topic = (m.display_info || "").split("\n")[0].trim() || "(no topic)";
+      const desc = m.meta_data?.description || "";
+      const orgMatch = desc.match(/组织者[：:]\s*([^\s|]+)/);
+      const organizer = orgMatch?.[1] || "";
+      lines.push(`- **${topic}**${organizer ? ` (${organizer})` : ""}`);
+    }
+    return lines.join("\n");
+  } catch { return null; }
+}
+
 function detectLang(text: string): "zh" | "en" {
   // Strip XML/HTML tags, mention placeholders, and URLs before sampling
   const cleaned = text
@@ -803,6 +879,9 @@ function buildClaudePrompt(
     "- Email: `lark-cli mail` commands",
     "- Docs: `lark-cli docs` commands",
     "- Tasks: `lark-cli task` commands",
+    "- Contacts: `lark-cli contact +search-user --query \"name\"` to find people by name",
+    "- Meetings: `lark-cli vc +search --start YYYY-MM-DD --end YYYY-MM-DD` to find past meetings, `lark-cli vc +notes --meeting-ids <id>` for meeting notes",
+    "- Doc search: `lark-cli docs +search --query \"keyword\"` to search cloud documents",
     "",
     "Do not mention tools, internal reasoning, or session mechanics.",
     persist
@@ -1081,6 +1160,158 @@ function enqueue<T>(bucketKey: string, task: () => Promise<T>): Promise<T> {
   return current;
 }
 
+// --- /pending command: surface unanswered @mentions, overdue tasks, unread email ---
+
+const PENDING_COMMAND_RE = /^\/pending\b|^pending(?:\s+@?mentions?)?\s*$|who.*waiting on me|unanswered.*@|pending.*@\s*me|谁.*@.*我|未回复/i;
+
+async function fetchUnreadMentions(): Promise<string | null> {
+  try {
+    // Search @me messages from the last 3 days
+    const threeDaysAgo = new Date(Date.now() - 3 * 86_400_000);
+    const tz = "+08:00";
+    const startISO = threeDaysAgo.toISOString().slice(0, 19) + tz;
+    const raw = await runLarkCli([
+      "im", "+messages-search", "--is-at-me", "--page-size", "30",
+      "--start", startISO, "--format", "json",
+    ]);
+    const data = JSON.parse(raw);
+    const msgs: any[] = data.data?.messages || [];
+    if (!msgs.length) return null;
+
+    const ownerOpenId = CONFIG.ownerOpenId;
+
+    // Filter: only messages from others that directly @me (not just @all)
+    const directMentions = msgs.filter((m: any) => {
+      if (m.sender?.id === ownerOpenId) return false;
+      const mentions = m.mentions || [];
+      const isAtMe = mentions.some((mt: any) => mt.id === ownerOpenId);
+      const content = m.content || "";
+      const isAtAll = /@all|@_all/.test(content);
+      return isAtMe || !isAtAll;  // keep if directly @me, or not just @all
+    });
+    if (!directMentions.length) return null;
+
+    // Group by chat, keep latest per chat
+    const byChat = new Map<string, any>();
+    for (const m of directMentions) {
+      const cid = m.chat_id || "";
+      if (!byChat.has(cid)) byChat.set(cid, { ...m, count: 1 });
+      else byChat.get(cid)!.count++;
+    }
+
+    // Cross-check: for each chat, see if user has replied after the @mention
+    const pending: { chat: string; sender: string; time: string; content: string; count: number }[] = [];
+    for (const [chatId, m] of byChat) {
+      try {
+        const chatRaw = await runLarkCli([
+          "im", "+chat-messages-list", "--chat-id", chatId,
+          "--page-size", "5", "--sort", "desc", "--format", "json",
+        ]);
+        const chatData = JSON.parse(chatRaw);
+        const chatMsgs: any[] = chatData.data?.items || [];
+        const userReplied = chatMsgs.some((cm: any) => cm.sender?.id === ownerOpenId);
+        if (userReplied) continue; // user already responded in this chat
+      } catch {
+        // JSON parse error — include it as pending to be safe
+      }
+
+      const chatName = m.chat_name || "P2P";
+      const sender = m.sender?.name || "(unknown)";
+      const content = (m.content || "").replace(/<[^>]+>/g, "").replace(/@[^\s]+\s*/g, "").trim().slice(0, 100);
+      pending.push({ chat: chatName, sender, time: m.create_time || "", content, count: m.count });
+    }
+
+    if (!pending.length) return null;
+
+    const lines = [`**${pending.length} chat${pending.length > 1 ? "s" : ""} with unanswered @mentions:**\n`];
+    for (const p of pending) {
+      const extra = p.count > 1 ? ` (${p.count} msgs)` : "";
+      lines.push(`- **${p.sender}** [${p.chat}] ${p.time}${extra}\n  ${p.content}`);
+    }
+    return lines.join("\n");
+  } catch (err) {
+    log(`fetchUnreadMentions error: ${err}`);
+    return null;
+  }
+}
+
+async function handlePendingCommand(): Promise<string> {
+  const today = new Date().toISOString().slice(0, 10);
+
+  const [mentionsResult, tasksResult, emailResult] = await Promise.allSettled([
+    fetchUnreadMentions(),
+    runLarkCli(["task", "+get-my-tasks", "--format", "json", "--page-all"]),
+    runLarkCli(["mail", "+triage", "--max", "5", "--format", "json"]),
+  ]);
+
+  const sections: string[] = [];
+
+  // @mentions
+  const mentionsText = mentionsResult.status === "fulfilled" ? mentionsResult.value : null;
+  if (mentionsText) sections.push(mentionsText);
+
+  // Due-today + recent overdue tasks (cap at 5, summarize the rest)
+  if (tasksResult.status === "fulfilled") {
+    try {
+      const data = JSON.parse(tasksResult.value);
+      const items: any[] = data.data?.items || data.data || [];
+      const now = Date.now();
+      const sevenDaysAgo = now - 7 * 86_400_000;
+      const dueToday = items.filter(
+        (t: any) => t.due_at && t.due_at.slice(0, 10) === today && new Date(t.due_at).getTime() >= now
+      );
+      const recentOverdue = items.filter(
+        (t: any) => t.due_at && new Date(t.due_at).getTime() < now && new Date(t.due_at).getTime() >= sevenDaysAgo
+      );
+      const olderOverdue = items.filter(
+        (t: any) => t.due_at && new Date(t.due_at).getTime() < sevenDaysAgo
+      );
+      if (dueToday.length || recentOverdue.length || olderOverdue.length) {
+        const taskLines = ["**Pending tasks:**\n"];
+        for (const t of dueToday) {
+          taskLines.push(`- **Due today** ${t.summary || "(no title)"}`);
+        }
+        for (const t of recentOverdue.slice(0, 5)) {
+          taskLines.push(`- **OVERDUE** ${t.summary || "(no title)"} (due ${t.due_at?.slice(0, 10)})`);
+        }
+        if (recentOverdue.length > 5) {
+          taskLines.push(`- _...and ${recentOverdue.length - 5} more from this week_`);
+        }
+        if (olderOverdue.length) {
+          taskLines.push(`- _${olderOverdue.length} older overdue task${olderOverdue.length > 1 ? "s" : ""} (>7 days)_`);
+        }
+        sections.push(taskLines.join("\n"));
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Unread emails
+  if (emailResult.status === "fulfilled") {
+    try {
+      const messages = JSON.parse(emailResult.value);
+      if (Array.isArray(messages)) {
+        const unread = messages.filter((m) => (m.labels || "").includes("UNREAD"));
+        if (unread.length) {
+          const emailLines = [
+            `**${unread.length} unread email${unread.length > 1 ? "s" : ""}:**\n`,
+          ];
+          for (const m of unread.slice(0, 5)) {
+            const from = (m.from || "").replace(/<[^>]+>/g, "").trim();
+            emailLines.push(`- **${from}**: ${m.subject || "(no subject)"}`);
+          }
+          sections.push(emailLines.join("\n"));
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  if (!sections.length) {
+    return "No pending @mentions, overdue tasks, or unread emails.";
+  }
+
+  return sections.join("\n\n");
+}
+
 async function handleComplex(
   instruction: string,
   messageId: string,
@@ -1128,6 +1359,34 @@ function handleInbound(instruction: string, messageId: string, isForward = false
   (async () => {
     const start = Date.now();
 
+    // Fast-path: /pending command — no Haiku dispatch, parallel lark-cli calls
+    if (!isForward && PENDING_COMMAND_RE.test(instruction.trim())) {
+      enqueue("chat_history", async () => {
+        logJson(EVENTS_FILE, {
+          type: "inbound",
+          messageId,
+          instruction: instruction.slice(0, 300),
+          routeMode: "command",
+          bucket: "chat_history",
+          model: "none",
+          dispatchReason: "pending_command",
+          isForward: false,
+          simple: true,
+          tools: false,
+          compressed: false,
+          queueAhead: 0,
+        });
+        const reply = await handlePendingCommand();
+        await sendReply(formatReplyForLark(reply), { type: "simple", messageId, bucket: "chat_history" });
+        logJson(EVENTS_FILE, { type: "simple_complete", messageId, durationMs: Date.now() - start, bucket: "chat_history" });
+      }).catch(async (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        log(`pending command error: ${message}`);
+        try { await sendReply("Error fetching pending items. Please retry.", { type: "error", messageId }); } catch { /* ignore */ }
+      });
+      return;
+    }
+
     // For long non-forward text, run Haiku extraction to compress before reasoning
     // Forwards are already extracted upstream via extractForward()
     let processed = instruction;
@@ -1165,6 +1424,28 @@ function handleInbound(instruction: string, messageId: string, isForward = false
         compressed: processed !== instruction,
         queueAhead,
       });
+
+      // Contact / meeting lookups — regex-gated, independent of Haiku simple flag
+      if (!isForward) {
+        const contactMatch = /who is|find\s+\w|search.*contact|谁是|查.*人|通讯录/i.test(instruction);
+        const meetingMatch = /meeting|会议/i.test(instruction);
+        if (contactMatch) {
+          const result = await handleSimpleContactSearch(extractContactQuery(instruction));
+          if (result !== null) {
+            await sendReply(result, { type: "simple", messageId, bucket: bucket.key });
+            logJson(EVENTS_FILE, { type: "simple_complete", messageId, durationMs: Date.now() - start, bucket: bucket.key });
+            return;
+          }
+        }
+        if (meetingMatch && dispatch.simple) {
+          const result = await handleSimpleMeetingSearch(dispatch.dateStart, dispatch.dateEnd);
+          if (result !== null) {
+            await sendReply(result, { type: "simple", messageId, bucket: bucket.key });
+            logJson(EVENTS_FILE, { type: "simple_complete", messageId, durationMs: Date.now() - start, bucket: bucket.key });
+            return;
+          }
+        }
+      }
 
       // Try simple handlers only when Haiku explicitly says it's a simple data lookup
       if (dispatch.simple && !isForward) {
@@ -1534,6 +1815,7 @@ Bun.serve({
     // Determine if this should be buffered (forwarded content, URL-only messages)
     const isUrlOnly = messageType === "text" && /^\s*https?:\/\/\S+\s*$/.test(text);
     const larkDocMatch = isUrlOnly && /larksuite\.com\/(docx|wiki)\/([A-Za-z0-9]+)/.test(text.trim());
+    const larkMinutesMatch = isUrlOnly && /larksuite\.com\/minutes\/([A-Za-z0-9]+)/.test(text.trim());
     const shouldBuffer = messageType === "interactive" || messageType === "post" || messageType === "file" || messageType === "image" || messageType === "merge_forward" || isUrlOnly;
 
     if (shouldBuffer) {
@@ -1552,6 +1834,12 @@ Bun.serve({
                 ? { default_action: "Summarize this Lark document.", clean_extract: content }
                 : { default_action: `Fetch and summarize this link: ${forwardText}`, clean_extract: forwardText }
             )
+          : (isUrlOnly && larkMinutesMatch)
+            ? fetchMeetingNotes(forwardText.trim().match(/\/minutes\/([A-Za-z0-9]+)/)?.[1] || "").then(content =>
+                content
+                  ? { default_action: "Summarize these meeting notes.", clean_extract: content }
+                  : { default_action: `Fetch and summarize this link: ${forwardText}`, clean_extract: forwardText }
+              )
           : isUrlOnly
             ? Promise.resolve({ default_action: `Fetch and summarize this link: ${forwardText}`, clean_extract: forwardText })
             : extractForward(forwardText);
