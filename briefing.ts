@@ -141,9 +141,11 @@ async function callOpusDirect(
   userContent: string,
   maxTokens = 8192,
 ): Promise<{ text: string; usage: ClaudeUsage; costUsd: number }> {
+  const API_TIMEOUT_MS = 180_000; // 3 minutes — Opus can be slow but shouldn't take longer
   for (let attempt = 1; attempt <= 2; attempt++) {
     const resp = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
       headers: {
         "content-type": "application/json",
         "x-api-key": CONFIG.anthropicApiKey,

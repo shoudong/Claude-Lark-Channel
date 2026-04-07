@@ -1162,7 +1162,7 @@ function enqueue<T>(bucketKey: string, task: () => Promise<T>): Promise<T> {
 
 // --- /pending command: surface unanswered @mentions, overdue tasks, unread email ---
 
-const PENDING_COMMAND_RE = /^\/pending\b|^pending(?:\s+@?mentions?)?\s*$|who.*waiting on me|unanswered.*@|pending.*@\s*me|谁.*@.*我|未回复/i;
+const PENDING_COMMAND_RE = /^\/pending\b|^pending(?:\s+@?mentions?)?\s*$|who.*waiting on me|unanswered.*@|pending.*@\s*me|mention.*(?:my name|me).*(?:pending|respond|reply|unanswered)|pending.*(?:my (?:response|reply))|谁.*@.*我|未回复|@.*我.*未回/i;
 
 async function fetchUnreadMentions(): Promise<string | null> {
   try {
@@ -1400,6 +1400,26 @@ function handleInbound(instruction: string, messageId: string, isForward = false
     // This overrides Haiku misclassifying tools=false for action-oriented requests
     if (needsTools(instruction)) {
       dispatch.tools = true;
+    }
+    // Force tools=false for forwards with embedded content that only need text processing
+    // Haiku defaults to tools=true, but the content is already in the instruction — no fetch needed
+    if (isForward && dispatch.tools) {
+      const sepIdx = instruction.indexOf("---\n");
+      const hasEmbeddedContent = sepIdx > 0 && instruction.length > 500;
+      if (hasEmbeddedContent) {
+        // Extract just the user's actual instruction, stripping the server-generated auto-summary prefix
+        const userPart = (userInstruction || "").trim();
+        // Auto-summary (no user instruction) — content is embedded, only needs text processing
+        if (!userPart) {
+          dispatch.tools = false;
+        } else {
+          // User gave an instruction — check if it's just text processing
+          const isSummaryTask = /总结|summarize|summary|translate|翻译|rewrite|改写|extract|提取|analyze|分析/i.test(userPart);
+          if (isSummaryTask && !needsTools(userPart)) {
+            dispatch.tools = false;
+          }
+        }
+      }
     }
     const bucket = bucketConfig(dispatch.bucket);
     const model = dispatch.model === "opus" ? CONFIG.reasoningModel : CONFIG.defaultModel;
