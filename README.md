@@ -45,14 +45,18 @@ The core idea: **AI should compress noise, preserve signal, and increase follow-
 
 | Action | Example Message | What Happens |
 |--------|----------------|--------------|
-| Calendar lookup | "What meetings do I have today?" | Fetches your Lark calendar via lark-cli |
-| Email summary | "Check my latest emails" | Reads inbox via lark-cli |
+| Calendar lookup | "What meetings do I have today?" | Fetches your Lark calendar via lark-cli (zero tokens) |
+| Email summary | "Check my latest emails" | Reads inbox via lark-cli (zero tokens) |
+| Contact search | "Who is Agnes?" / "Find Peter" | Searches Lark contacts via lark-cli (zero tokens) |
+| Meeting history | "What meetings did I have yesterday?" | Searches past meetings via lark-cli (zero tokens) |
+| Pending items | "/pending" / "Who's waiting on me?" | Shows unanswered @mentions, overdue tasks, unread emails (zero tokens) |
 | Forward an email | Forward any email card | Claude extracts key info, strips boilerplate, summarizes |
-| Forward a document | Forward a Lark doc / wiki page | Claude reads and analyzes it |
+| Forward a document | Forward a Lark doc / wiki page | Pre-fetches via `docs +fetch`, then Claude analyzes |
+| Forward meeting minutes | Forward a minutes URL | Pre-fetches notes via `vc +notes` → `docs +fetch`, then Claude summarizes |
 | Draft a reply | Forward email + "draft a reply declining politely" | Claude merges forward content with your instruction |
 | Deep analysis | "Analyze this quarterly report and note key takeaways" | Full Claude reasoning with Sonnet/Opus |
 | Save to memory | "Summarize this and save" | Claude writes structured notes to Obsidian vault |
-| Task management | "Show my tasks" / "What's overdue?" | Reads Lark Tasks |
+| Task management | "Show my tasks" / "What's overdue?" | Reads Lark Tasks (zero tokens) |
 | Follow-ups | "Draft a reply to that" (after forwarding something) | Routes to same context bucket as the prior forward |
 
 **Scheduled batch jobs (cron-based, separate from webhook)**
@@ -92,45 +96,59 @@ The core idea: **AI should compress noise, preserve signal, and increase follow-
 ## Architecture
 
 ```
-┌──────────┐     webhook     ┌───────────────────┐     stdin/out     ┌────────────────────┐
-│          │  ──────────────▶ │                   │  ──────────────▶  │                    │
-│   Lark   │                 │   Channel Server   │                  │   Claude Code      │
-│  (User)  │  ◀──────────── │   (Bun + TS)       │  ◀──────────────  │   (Sonnet/Opus)    │
-│          │  lark-cli reply │                   │     JSON result   │                    │
-└──────────┘                 └───────┬───────────┘                   └────────┬───────────┘
-                                     │                                        │
-                                     │ lark-cli                               │ write
-                                     │ (simple tasks)                         │ (save notes)
-                                     ▼                                        ▼
-                              ┌──────────────┐                        ┌──────────────────┐
-                              │  Lark APIs   │                        │  Obsidian Vault   │
-                              │  (calendar,  │                        │  (persistent      │
-                              │   email,     │                        │   memory layer)   │
-                              │   docs...)   │                        │                   │
-                              └──────────────┘                        └──────────────────┘
+┌──────────┐     webhook     ┌────────────────────────────────────────────────┐
+│          │ ───────────────▶ │            Channel Server (Bun + TS)          │
+│   Lark   │                 │                                                │
+│  (User)  │                 │  ┌─────────────────────────────────────────┐   │
+│          │                 │  │  Haiku Dispatcher (direct Anthropic API) │   │
+│          │                 │  │  • classifies bucket + model             │   │
+│          │                 │  │  • extracts/compresses forwarded content │   │
+│          │                 │  │  • decides simple vs tools vs direct     │   │
+│          │                 │  └──────────┬──────────────────────────────┘   │
+│          │                 │             │                                   │
+│          │                 │    ┌────────┼────────────┐                     │
+│          │                 │    ▼        ▼            ▼                     │
+│          │                 │  Zero-   Sonnet      Sonnet/Opus              │
+│          │                 │  token   Direct      (claude -p)              │
+│          │                 │  lark-   API         Full tool                │
+│          │  ◀───────────── │  cli     (no tools)  access                   │
+│          │   bot reply     │                                                │
+└──────────┘                 └──────────┬─────────────────┬──────────────────┘
+                                        │                 │
+                                        ▼                 ▼
+                                 ┌──────────────┐  ┌──────────────────┐
+                                 │  Lark APIs   │  │  Obsidian Vault   │
+                                 │  calendar,   │  │  persistent       │
+                                 │  email, docs,│  │  memory layer     │
+                                 │  contacts,   │  │                   │
+                                 │  meetings    │  │                   │
+                                 └──────────────┘  └──────────────────┘
 ```
 
 ### Three layers
 
-1. **Lark** — your daily work happens here. Messages, emails, calendar, documents, meetings. The channel server receives webhook events from Lark whenever you send a message in the Claude Channel group.
+1. **Lark** — your daily work happens here. Messages, emails, calendar, documents, meetings, contacts. The channel server receives webhook events from Lark whenever you send a message in the Claude Channel group.
 
 2. **Channel Server (this repo)** — a Bun/TypeScript HTTP server that:
    - Receives Lark webhook events
    - Validates sender identity (3-layer security)
    - Uses **Haiku** (fast, cheap) to classify the message and extract/compress forwarded content
-   - Routes simple tasks directly to lark-cli (zero AI tokens)
-   - Routes complex tasks to Claude Code sessions with full tool access
+   - Routes simple tasks directly to lark-cli (zero AI tokens): calendar, tasks, email, contacts, meetings, pending @mentions
+   - Routes text-only tasks to Sonnet direct API (no tool overhead)
+   - Routes complex tasks to Claude Code sessions (Sonnet/Opus) with full tool access
    - Manages per-bucket session queues with automatic rotation
 
 3. **Obsidian** — local markdown vault that serves as Claude's long-term memory. Structured folders for strategy, customers, decisions, meeting notes, etc. Syncs across machines via iCloud or Obsidian Sync. Claude reads relevant notes at session start and writes new insights when you say "save."
 
-### Two-tier model usage
+### Three-tier model usage
 
-| Model | Role | Latency | Cost |
-|-------|------|---------|------|
-| **Haiku** (direct Anthropic API) | Routing + content extraction/compression | ~300-800ms | ~$0.001 per call |
-| **Sonnet** (`claude -p` CLI) | Default reasoning with full tool access | 5-15s | ~$0.01-0.05 per task |
-| **Opus** (`claude -p` CLI) | Deep reasoning (only when explicitly requested) | 10-30s | ~$0.05-0.15 per task |
+| Tier | Model | Role | Latency | Cost |
+|------|-------|------|---------|------|
+| 0 | **None** (lark-cli only) | Simple lookups: calendar, tasks, email, contacts, meetings, `/pending` | ~1-3s | **Free** |
+| 1 | **Haiku** (direct Anthropic API) | Routing + content extraction/compression | ~300-800ms | ~$0.001 per call |
+| 2 | **Sonnet** (direct Anthropic API) | Text-only tasks — summarize, translate, draft (no tool access needed) | 2-5s | ~$0.003-0.01 per task |
+| 3 | **Sonnet** (`claude -p` CLI) | Reasoning with full tool access — research, multi-step actions | 5-15s | ~$0.01-0.05 per task |
+| 4 | **Opus** (`claude -p` CLI) | Deep reasoning (only when explicitly requested) | 10-30s | ~$0.05-0.15 per task |
 
 ### Bucketed sessions
 
@@ -143,8 +161,8 @@ Messages are routed into topic buckets (`calendar`, `email`, `lark_docs`, `chat_
 
 ### Forward + merge window
 
-When you forward content (email, doc, message), the server:
-1. Immediately starts Haiku extraction (strips boilerplate, signatures, noise)
+When you forward content (email, doc, message, minutes URL), the server:
+1. Immediately starts extraction — Haiku for text, `docs +fetch` for Lark docs, `vc +notes` for meeting minutes
 2. Opens a 5-second merge window
 3. If you send a follow-up instruction within 5s, it merges your instruction with the clean extract
 4. If no instruction arrives, Claude auto-summarizes with a default action
@@ -469,31 +487,45 @@ bun test-reliability.ts
 Message arrives
      │
      ▼
-┌─ Is it a forwarded email/doc/post? ──────────────────────────┐
+┌─ Fast-path command? (/pending, contacts, meetings) ──────────┐
 │                                                               │
-│  YES                                        NO                │
-│   │                                          │                │
-│   ▼                                          ▼                │
-│  Haiku extracts + compresses              Is text > 500      │
-│  Opens 5s merge window                    chars?              │
-│   │                                          │                │
-│   ├── User sends instruction ──▶ Merge    YES: Haiku compress │
-│   │   within 5s                           NO: Pass through    │
-│   │                                          │                │
-│   └── No instruction ──▶ Auto-summarize      │                │
-│                                              │                │
-└──────────────────────────┬───────────────────┘
-                           │
-                           ▼
-                   Haiku dispatches:
-                   → bucket (calendar/email/general/...)
-                   → model (sonnet/opus)
-                           │
-                           ▼
-                   Queued to bucket session
-                   → Claude Code processes with tools
-                   → Reply sent to Lark
-                   → Memory saved to Obsidian
+│  YES → lark-cli directly → reply (zero tokens, ~1-3s)        │
+│                                                               │
+│  NO                                                           │
+│   │                                                           │
+│   ▼                                                           │
+│  Is it forwarded content / URL / file?                        │
+│   │                                                           │
+│   ├── YES                                      NO             │
+│   │    │                                        │             │
+│   │    ▼                                        ▼             │
+│   │  Extract content:                        Is text > 500   │
+│   │  • Lark doc → docs +fetch                chars?           │
+│   │  • Minutes URL → vc +notes               YES: Haiku      │
+│   │  • Text → Haiku compress                      compress   │
+│   │  Open 5s merge window                    NO: Pass through │
+│   │   │                                        │             │
+│   │   ├── Instruction within 5s → Merge        │             │
+│   │   └── No instruction → Auto-summarize      │             │
+│   │                                             │             │
+│   └─────────────────────┬───────────────────────┘             │
+│                         │                                     │
+│                         ▼                                     │
+│                 Haiku dispatches:                              │
+│                 → bucket, model, simple, tools                │
+│                         │                                     │
+│            ┌────────────┼────────────┐                        │
+│            ▼            ▼            ▼                        │
+│         Simple       Sonnet       Sonnet/Opus                │
+│         handler      Direct       (claude -p)                │
+│         (lark-cli)   API          + tools                    │
+│         0 tokens     ~$0.003      ~$0.01-0.15                │
+│                                                               │
+└───────────────────────┬───────────────────────────────────────┘
+                        │
+                        ▼
+                  Reply sent to Lark
+                  Memory saved to Obsidian (if applicable)
 ```
 
 ---
@@ -502,14 +534,17 @@ Message arrives
 
 | Action | Haiku Tokens | Sonnet/Opus Tokens | Cost |
 |--------|-------------|-------------------|------|
-| Simple task (calendar, tasks, email) | 0 | 0 | **Free** — handled by lark-cli directly |
+| Simple lookup (calendar, tasks, email, contacts, meetings) | 0 | 0 | **Free** — lark-cli directly |
+| `/pending` (unanswered @mentions + overdue tasks + unread email) | 0 | 0 | **Free** — lark-cli directly |
+| Lark doc / minutes URL pre-fetch | 0 | 0 | **Free** — `docs +fetch` / `vc +notes` directly |
 | Message routing | ~500 input + ~100 output | 0 | ~$0.001 |
 | Forward extraction | ~1000 input + ~300 output | 0 | ~$0.002 |
+| Text-only task (Sonnet direct API) | ~500 (routing) | ~1-3K | ~$0.003-0.01 |
 | Complex task (analysis, drafting) | ~500 (routing) | ~5-10K | ~$0.01-0.05 |
 | Deep reasoning (Opus) | ~500 (routing) | ~10-20K | ~$0.05-0.15 |
 | Idle | 0 | 0 | **Free** |
 
-Key design decision: **Haiku handles all classification and extraction work** (~300-800ms, fractions of a cent). Sonnet/Opus is only invoked when genuine reasoning is needed. Simple tasks bypass AI entirely.
+Key design decision: **Haiku handles all classification and extraction work** (~300-800ms, fractions of a cent). Sonnet/Opus is only invoked when genuine reasoning is needed. Simple tasks and data lookups bypass AI entirely — the server calls lark-cli directly and formats the response.
 
 ---
 
