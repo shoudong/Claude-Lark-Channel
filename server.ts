@@ -3,15 +3,6 @@
 import { mkdirSync, existsSync, readFileSync, appendFileSync, writeFileSync, statSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-type SessionInfo = {
-  sessionId: string;
-  updatedAt: string;
-  turns: number;
-  bucket: string;
-  model: string;
-};
-
-type SessionState = Record<string, SessionInfo>;
 
 type ClaudeStructuredResult = {
   reply_markdown: string;
@@ -22,6 +13,8 @@ type BucketConfig = {
   key: string;
   label: string;
 };
+
+type ReplyLang = "zh" | "en" | "auto";
 
 type ClaudeUsage = {
   input_tokens?: number;
@@ -55,12 +48,8 @@ const CONFIG = {
   reasoningModel: process.env.CLAUDE_MODEL_REASONING ?? "opus",
   haikuModel: process.env.CLAUDE_MODEL_HAIKU ?? "claude-haiku-4-5-20251001",
   claudePermissionMode: process.env.CLAUDE_PERMISSION_MODE ?? "dontAsk",
-  bucketMemoryTailChars: Number(process.env.LARK_BUCKET_MEMORY_TAIL_CHARS ?? "4000"),
-  maxSessionTurns: Number(process.env.LARK_MAX_SESSION_TURNS ?? "16"),
-  sessionStaleMs: Number(process.env.LARK_SESSION_STALE_MS ?? String(60 * 60 * 1000)), // 1 hour
 };
 
-const SESSION_FILE = join(CONFIG.stateDir, "sessions.json");
 const EVENTS_FILE = join(CONFIG.stateDir, "events.jsonl");
 const OUTBOX_FILE = join(CONFIG.stateDir, "outbox.jsonl");
 const CLAUDE_RAW_FILE = join(CONFIG.stateDir, "claude-raw.jsonl");
@@ -85,6 +74,7 @@ let pendingForward: {
   messageId: string;
   extraction: Promise<ForwardExtract>;
   timer: ReturnType<typeof setTimeout>;
+  contentLang: ReplyLang;
 } | null = null;
 const FORWARD_MERGE_WINDOW_MS = 5_000;
 
@@ -116,23 +106,7 @@ function isDuplicate(messageId: string): boolean {
   return false;
 }
 
-function loadSessionState(): SessionState {
-  try {
-    if (!existsSync(SESSION_FILE)) return {};
-    return JSON.parse(readFileSync(SESSION_FILE, "utf8")) as SessionState;
-  } catch (error) {
-    log(`failed to load sessions: ${error}`);
-    return {};
-  }
-}
 
-function saveSessionState(state: SessionState): void {
-  writeFileSync(SESSION_FILE, JSON.stringify(state, null, 2));
-}
-
-function sessionStateKey(bucket: string): string {
-  return `${CONFIG.chatId}:${bucket}`;
-}
 
 function bucketMemoryFile(bucket: string): string {
   return join(BUCKET_MEMORY_DIR, `${bucket}.md`);
@@ -145,12 +119,6 @@ function trimLargeFile(path: string, keepChars: number): void {
   writeFileSync(path, `# Memory Snapshot\n\n${content.slice(-keepChars)}`);
 }
 
-function readBucketMemory(bucket: string): string {
-  const file = bucketMemoryFile(bucket);
-  if (!existsSync(file)) return "";
-  const content = readFileSync(file, "utf8");
-  return content.slice(-CONFIG.bucketMemoryTailChars);
-}
 
 function appendBucketMemory(bucket: string, instruction: string, result: ClaudeStructuredResult): string {
   const file = bucketMemoryFile(bucket);
@@ -321,6 +289,8 @@ type DispatchDecision = {
   model: "sonnet" | "opus";
   simple: boolean; // true = zero-token deterministic handler, false = needs reasoning model
   tools: boolean;  // true = needs claude -p (tool access), false = direct API is sufficient
+  dateStart?: string; // YYYY-MM-DD for date-based lookups
+  dateEnd?: string;   // YYYY-MM-DD for date-based lookups
   reasoning: string;
 };
 
@@ -339,8 +309,8 @@ Model selection:
 - opus: ONLY when the user explicitly asks for deep reasoning ("use opus", "think deeply")
 
 Simple vs reasoning:
-- SIMPLE=yes: ONLY for "show me today's calendar/agenda" or "show my tasks" — a pure data lookup for TODAY with no analysis
-- SIMPLE=no: everything else
+- SIMPLE=yes: Pure data lookups with no analysis needed — e.g. "show today's calendar", "show tomorrow's agenda", "what meetings do I have on Friday", "show my tasks", "what's on my schedule next week"
+- SIMPLE=no: anything requiring reasoning, composition, multi-step actions, or analysis
 
 Tools needed (DEFAULT IS YES — only say no when you are certain):
 - TOOLS=yes: DEFAULT. Use for anything that might need external data, file access, or actions. This includes: checking calendar, reading emails, looking up tasks, searching chat, saving/writing files, reading documents, sending messages, opening links, any ambiguous request.
@@ -354,19 +324,23 @@ ${recentContext()}
 Current message${isForward ? " (forwarded content)" : ""}:
 ${instruction.slice(0, 500)}
 
-Respond in exactly this format (5 lines, no extra text):
+Today is ${new Date().toISOString().slice(0, 10)} (${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()]}).
+
+Respond in exactly this format (6 lines, no extra text):
 BUCKET: <bucket name>
 MODEL: <sonnet or opus>
 SIMPLE: <yes or no>
 TOOLS: <yes or no>
+DATE_RANGE: <YYYY-MM-DD to YYYY-MM-DD, or "none" if not a date-based lookup. For "today" use today's date. For "this week" use Mon-Sun. For "tomorrow" use tomorrow's date for both start and end.>
 REASON: <one short sentence>`;
 
   try {
-    const output = await callHaiku(prompt, 140, "_dispatch");
+    const output = await callHaiku(prompt, 160, "_dispatch");
     const bucketMatch = output.match(/BUCKET:\s*(\S+)/i);
     const modelMatch = output.match(/MODEL:\s*(\S+)/i);
     const simpleMatch = output.match(/SIMPLE:\s*(\S+)/i);
     const toolsMatch = output.match(/TOOLS:\s*(\S+)/i);
+    const dateRangeMatch = output.match(/DATE_RANGE:\s*(.+)/i);
     const reasonMatch = output.match(/REASON:\s*(.+)/i);
 
     const bucket = bucketMatch?.[1] || "general";
@@ -375,12 +349,26 @@ REASON: <one short sentence>`;
     const simple = simpleMatch?.[1]?.toLowerCase() === "yes";
     const tools = toolsMatch?.[1]?.toLowerCase() !== "no"; // default to yes (conservative)
 
-    log(`haiku dispatch: ${bucket} / ${model} / simple=${simple} / tools=${tools} — ${reasonMatch?.[1]?.slice(0, 60) || "no reason"}`);
+    // Parse date range from Haiku (e.g. "2026-04-08 to 2026-04-08")
+    let dateStart: string | undefined;
+    let dateEnd: string | undefined;
+    const dateStr = dateRangeMatch?.[1]?.trim();
+    if (dateStr && dateStr !== "none") {
+      const dates = dateStr.match(/(\d{4}-\d{2}-\d{2})\s*to\s*(\d{4}-\d{2}-\d{2})/);
+      if (dates) {
+        dateStart = dates[1];
+        dateEnd = dates[2];
+      }
+    }
+
+    log(`haiku dispatch: ${bucket} / ${model} / simple=${simple} / tools=${tools}${dateStart ? ` / ${dateStart}..${dateEnd}` : ""} — ${reasonMatch?.[1]?.slice(0, 60) || "no reason"}`);
     return {
       bucket: validBuckets.includes(bucket) ? bucket : "general",
       model,
       simple,
       tools,
+      dateStart,
+      dateEnd,
       reasoning: reasonMatch?.[1] || "",
     };
   } catch (err) {
@@ -594,6 +582,24 @@ async function runLarkCli(args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+async function fetchLarkDoc(url: string): Promise<string | null> {
+  try {
+    const result = await runProcess(
+      [CONFIG.larkCli, "docs", "+fetch", "--doc", url, "--format", "pretty"],
+      { timeoutMs: 15_000 }
+    );
+    if (result.code !== 0) {
+      log(`lark doc fetch failed (code ${result.code}): ${result.stderr.slice(0, 200)}`);
+      return null;
+    }
+    const content = result.stdout.trim();
+    return content || null;
+  } catch (err) {
+    log(`lark doc fetch error: ${err}`);
+    return null;
+  }
+}
+
 async function sendReply(text: string, meta: Record<string, unknown> = {}): Promise<void> {
   const args = [
     "im",
@@ -635,22 +641,44 @@ async function sendReply(text: string, meta: Record<string, unknown> = {}): Prom
   throw new Error(`sendReply failed: ${lastError}`);
 }
 
-async function handleSimpleCalendar(_instruction: string): Promise<string | null> {
-  // Haiku already decided this is a simple today-only calendar lookup
-  const raw = await runLarkCli(["calendar", "+agenda", "--format", "json"]);
+async function handleSimpleCalendar(dateStart?: string, dateEnd?: string): Promise<string | null> {
+  const args = ["calendar", "+agenda", "--format", "json"];
+  if (dateStart) args.push("--start", dateStart);
+  if (dateEnd) args.push("--end", dateEnd);
+  const raw = await runLarkCli(args);
   try {
     const data = JSON.parse(raw);
     const events = data.data || [];
-    if (!events.length) return "No events on your calendar today.";
 
-    const lines = ["**Today's agenda:**\n"];
+    // Build a human-readable date label
+    const today = new Date().toISOString().slice(0, 10);
+    const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+    let label: string;
+    if (!dateStart || dateStart === today) {
+      label = "Today's agenda";
+    } else if (dateStart === dateEnd || !dateEnd) {
+      label = dateStart === tomorrow ? "Tomorrow's agenda" : `Agenda for ${dateStart}`;
+    } else {
+      label = `Agenda ${dateStart} — ${dateEnd}`;
+    }
+
+    if (!events.length) return `**${label}:** No events.`;
+
+    const lines = [`**${label}:**\n`];
+    let currentDate = "";
     for (const event of events) {
       const summary = event.summary || "(no title)";
       const start = event.start_time?.datetime || "";
       const end = event.end_time?.datetime || "";
+      const eventDate = start.slice(0, 10);
+      // Add date header when spanning multiple days
+      if (dateStart !== dateEnd && eventDate !== currentDate) {
+        currentDate = eventDate;
+        lines.push(`\n**${eventDate}**`);
+      }
       const st = start.slice(11, 16);
       const et = end ? end.slice(11, 16) : "";
-      lines.push(`- ${st}-${et}  ${summary}`);
+      lines.push(`- **${st}–${et}**  ${summary}`);
     }
     return lines.join("\n");
   } catch {
@@ -658,55 +686,123 @@ async function handleSimpleCalendar(_instruction: string): Promise<string | null
   }
 }
 
-async function handleSimpleTasks(_instruction: string): Promise<string | null> {
-  // Haiku already decided this is a simple task lookup
-  const raw = await runLarkCli(["task", "+get-my-tasks", "--format", "json"]);
+async function handleSimpleTasks(dateStart?: string, dateEnd?: string): Promise<string | null> {
+  const args = ["task", "+get-my-tasks", "--format", "json", "--page-all"];
+  if (dateStart) args.push("--due-start", dateStart);
+  if (dateEnd) args.push("--due-end", dateEnd);
+  const raw = await runLarkCli(args);
   try {
     const data = JSON.parse(raw);
     const items = data.data?.items || data.data || [];
-    if (!items.length) return "No active tasks found.";
+    if (!items.length) return dateStart ? `**No tasks due ${dateStart}${dateEnd && dateEnd !== dateStart ? ` — ${dateEnd}` : ""}.**` : "**No active tasks.**";
+
+    const now = Date.now();
+    // Sort: overdue first, then by due date, then no-due-date last
+    items.sort((a: any, b: any) => {
+      const aDue = a.due_at ? new Date(a.due_at).getTime() : Infinity;
+      const bDue = b.due_at ? new Date(b.due_at).getTime() : Infinity;
+      return aDue - bDue;
+    });
+
+    const overdue: string[] = [];
+    const upcoming: string[] = [];
+    const noDue: string[] = [];
+
+    for (const item of items) {
+      const summary = item.summary || "(no title)";
+      const dueTime = item.due_at ? new Date(item.due_at).getTime() : null;
+      const dueLabel = item.due_at ? item.due_at.slice(0, 10) : "";
+
+      if (dueTime && dueTime < now) {
+        overdue.push(`- **OVERDUE** ${summary} (due ${dueLabel})`);
+      } else if (dueTime) {
+        upcoming.push(`- ${summary} (due **${dueLabel}**)`);
+      } else {
+        noDue.push(`- ${summary}`);
+      }
+    }
 
     const lines = ["**Your tasks:**\n"];
-    for (const item of items.slice(0, 10)) {
-      const summary = item.summary || "(no title)";
-      const overdue =
-        item.due_at && new Date(item.due_at).getTime() < Date.now() ? " [OVERDUE]" : "";
-      lines.push(`- ${summary}${overdue}`);
+    if (overdue.length) {
+      lines.push(...overdue, "");
     }
-    if (items.length > 10) lines.push(`\n_...and ${items.length - 10} more_`);
+    lines.push(...upcoming);
+    if (noDue.length && !dateStart) {
+      lines.push("", "_No due date:_", ...noDue);
+    }
     return lines.join("\n");
   } catch {
     return null;
   }
 }
 
-async function handleSimpleEmail(_instruction: string): Promise<string | null> {
-  return null;
+async function handleSimpleEmail(): Promise<string | null> {
+  const raw = await runLarkCli(["mail", "+triage", "--max", "10", "--format", "json"]);
+  try {
+    const messages = JSON.parse(raw);
+    if (!Array.isArray(messages) || !messages.length) return "**No recent emails.**";
+
+    const lines = ["**Recent emails:**\n"];
+    for (const msg of messages) {
+      const date = msg.date || "";
+      const from = (msg.from || "").replace(/<[^>]+>/g, "").trim();
+      const subject = msg.subject || "(no subject)";
+      const labels = msg.labels || "";
+      const unread = labels.includes("UNREAD") ? " **[NEW]**" : "";
+      lines.push(`- ${date} — ${from}${unread}\n  ${subject}`);
+    }
+    return lines.join("\n");
+  } catch {
+    return null;
+  }
+}
+
+function detectLang(text: string): "zh" | "en" {
+  // Strip XML/HTML tags, mention placeholders, and URLs before sampling
+  const cleaned = text
+    .replace(/<[^>]+>/g, "")
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  // Sample more text (up to 2000 chars) to get past metadata-heavy headers
+  const sample = cleaned.slice(0, 2000);
+  const total = sample.replace(/\s/g, "").length || 1;
+  const zhChars = (sample.match(/[\u4e00-\u9fff]/g) || []).length;
+  return zhChars / total >= 0.10 ? "zh" : "en";
+}
+
+function langDirective(lang: ReplyLang): string {
+  if (lang === "zh") return "⚠️ LANGUAGE RULE (MANDATORY): Your ENTIRE reply MUST be in Chinese (中文). No English unless it is a proper noun, brand name, or technical term.";
+  if (lang === "en") return "⚠️ LANGUAGE RULE (MANDATORY): Your ENTIRE reply MUST be in English. No Chinese unless it is a proper noun or name.";
+  return "⚠️ LANGUAGE RULE (MANDATORY): Reply in the same language as the primary content. Chinese content → reply in Chinese. English content → reply in English.";
 }
 
 function buildClaudePrompt(
   instruction: string,
   persist: boolean,
   bucket: BucketConfig,
-  memoryText: string
+  lang: ReplyLang
 ): string {
-  const memoryBlock = memoryText
-    ? [`Recent ${bucket.label} memory from Obsidian:`, memoryText.trim(), ""].join("\n")
-    : "";
-
   return [
+    langDirective(lang),
+    "",
     `You are Claude Channel, a CEO's AI assistant (bucket: ${bucket.label}).`,
     "",
-    "Formatting rules (STRICT):",
-    "- Respond in the same language the user writes in",
-    "- Keep replies SHORT — max 10 lines for simple requests, max 20 for complex ones",
+    "Formatting rules:",
+    "- Be concise but COMPLETE — cover all important points. Short for simple questions, longer for rich documents. Never sacrifice key information for brevity.",
     "- Use bold for key info: names, dates, amounts, decisions",
     "- Use bullet points, NOT tables (Lark renders tables poorly)",
     "- No horizontal rules (---), no emoji headers, no decorative formatting",
     "- Lead with the answer or decision, then supporting details",
-    "- For emails/docs: one-line subject, then 3-5 bullet points max",
     "- For action items: bold the owner and deadline",
     "- Never say 'here is the summary' — just give the summary",
+    "",
+    "Tool guidance:",
+    "- The user's workspace is Lark (Feishu). For calendar, email, docs, chat, tasks — ALWAYS use lark-cli. Never use Google Calendar, Gmail, or other non-Lark tools.",
+    "- Calendar: `lark-cli calendar +agenda` for today, `lark-cli calendar +agenda --start YYYY-MM-DD --end YYYY-MM-DD` for other dates",
+    "- Email: `lark-cli mail` commands",
+    "- Docs: `lark-cli docs` commands",
+    "- Tasks: `lark-cli task` commands",
     "",
     "Do not mention tools, internal reasoning, or session mechanics.",
     persist
@@ -728,9 +824,10 @@ function buildClaudePrompt(
       : "Set save_note_markdown to null unless the user explicitly asked to save, note, or remember.",
     "If the request is ambiguous, make the best reasonable assumption and answer directly.",
     "",
-    memoryBlock,
     "User message:",
     instruction,
+    "",
+    langDirective(lang),
   ].filter(Boolean).join("\n");
 }
 
@@ -848,25 +945,17 @@ function updateDailyUsage(bucket: string, model: string, usage: ClaudeUsage, tot
   writeFileSync(USAGE_DAILY_FILE, JSON.stringify(root, null, 2));
 }
 
-function parseClaudeResult(raw: string): { sessionId: string; payload: ClaudeStructuredResult } {
+function parseClaudeResult(raw: string): ClaudeStructuredResult {
   const outer = JSON.parse(raw);
-  const sessionId = String(outer.session_id || "");
-  if (!sessionId) throw new Error("Claude result missing session_id");
 
   try {
-    return {
-      sessionId,
-      payload: normalizeClaudePayload(outer.structured_output ?? outer.result),
-    };
+    return normalizeClaudePayload(outer.structured_output ?? outer.result);
   } catch (error) {
     const fallbackText = extractFallbackText(outer);
     if (fallbackText) {
       return {
-        sessionId,
-        payload: {
-          reply_markdown: fallbackText,
-          save_note_markdown: null,
-        },
+        reply_markdown: fallbackText,
+        save_note_markdown: null,
       };
     }
     throw error;
@@ -876,28 +965,13 @@ function parseClaudeResult(raw: string): { sessionId: string; payload: ClaudeStr
 async function runClaude(
   instruction: string,
   bucket: BucketConfig,
-  model: string
+  model: string,
+  lang: ReplyLang,
+  isForward = false,
+  userInstruction?: string,
 ): Promise<ClaudeStructuredResult> {
-  const state = loadSessionState();
-  const key = sessionStateKey(bucket.key);
-  const current = state[key];
-  const isStale = current?.updatedAt
-    ? Date.now() - new Date(current.updatedAt).getTime() > CONFIG.sessionStaleMs
-    : false;
-  const existing = current && current.turns < CONFIG.maxSessionTurns && !isStale ? current : undefined;
-  const persist = shouldPersist(instruction);
-  const memoryText = existing?.sessionId ? "" : readBucketMemory(bucket.key);
-
-  if (current && !existing) {
-    delete state[key];
-    saveSessionState(state);
-    logJson(EVENTS_FILE, {
-      type: "session_rotated",
-      bucket: bucket.key,
-      reason: isStale ? "stale" : "max_turns",
-      priorTurns: current.turns,
-    });
-  }
+  // Check persist against user's instruction only — never match keywords inside forwarded doc content
+  const persist = shouldPersist(userInstruction ?? instruction);
 
   const args = [
     CONFIG.claudeCli,
@@ -910,14 +984,13 @@ async function runClaude(
     JSON_SCHEMA,
     "--model",
     model,
-    "--add-dir",
-    BUCKET_MEMORY_DIR,
   ];
 
-  if (existing?.sessionId) {
-    args.push("--resume", existing.sessionId);
+  if (persist) {
+    args.push("--add-dir", BUCKET_MEMORY_DIR);
   }
-  args.push("--", buildClaudePrompt(instruction, persist, bucket, memoryText));
+
+  args.push("--", buildClaudePrompt(instruction, persist, bucket, lang));
 
   const first = await runProcess(args, {
     cwd: CONFIG.claudeWorkdir,
@@ -926,10 +999,8 @@ async function runClaude(
 
   logJson(CLAUDE_RAW_FILE, {
     type: "claude_run",
-    phase: "first",
     bucket: bucket.key,
     model,
-    resumed: Boolean(existing?.sessionId),
     code: first.code,
     stdout: first.stdout.slice(0, 6000),
     stderr: first.stderr.slice(0, 2000),
@@ -937,73 +1008,22 @@ async function runClaude(
 
   if (first.code !== 0) {
     const detail = first.stderr.trim() || first.stdout.trim();
-    log(`claude failed${existing?.sessionId ? " on resume" : ""}: ${detail}`);
-    if (!existing?.sessionId) {
-      throw new Error(detail || "Claude request failed");
-    }
-
-    const retryArgs = args.filter((arg, idx) => !(arg === "--resume" || args[idx - 1] === "--resume"));
-    const retry = await runProcess(retryArgs, {
-      cwd: CONFIG.claudeWorkdir,
-      timeoutMs: 180_000,
-    });
-    logJson(CLAUDE_RAW_FILE, {
-      type: "claude_run",
-      phase: "retry_without_resume",
-      bucket: bucket.key,
-      model,
-      resumed: false,
-      code: retry.code,
-      stdout: retry.stdout.slice(0, 6000),
-      stderr: retry.stderr.slice(0, 2000),
-    });
-    if (retry.code !== 0) {
-      throw new Error(retry.stderr.trim() || retry.stdout.trim() || "Claude retry failed");
-    }
-    const retryUsage = parseClaudeUsage(retry.stdout.trim());
-    const parsedRetry = parseClaudeResult(retry.stdout.trim());
-    state[key] = {
-      sessionId: parsedRetry.sessionId,
-      updatedAt: new Date().toISOString(),
-      turns: 1,
-      bucket: bucket.key,
-      model,
-    };
-    saveSessionState(state);
-    updateDailyUsage(bucket.key, model, retryUsage.usage, retryUsage.totalCostUsd);
-    logJson(EVENTS_FILE, {
-      type: "usage",
-      bucket: bucket.key,
-      model,
-      resumed: false,
-      durationMs: retryUsage.durationMs,
-      totalCostUsd: retryUsage.totalCostUsd,
-      ...retryUsage.usage,
-    });
-    return parsedRetry.payload;
+    log(`claude failed: ${detail}`);
+    throw new Error(detail || "Claude request failed");
   }
 
   const firstUsage = parseClaudeUsage(first.stdout.trim());
   const parsed = parseClaudeResult(first.stdout.trim());
-  state[key] = {
-    sessionId: parsed.sessionId,
-    updatedAt: new Date().toISOString(),
-    turns: (existing?.turns ?? 0) + 1,
-    bucket: bucket.key,
-    model,
-  };
-  saveSessionState(state);
   updateDailyUsage(bucket.key, model, firstUsage.usage, firstUsage.totalCostUsd);
   logJson(EVENTS_FILE, {
     type: "usage",
     bucket: bucket.key,
     model,
-    resumed: Boolean(existing?.sessionId),
     durationMs: firstUsage.durationMs,
     totalCostUsd: firstUsage.totalCostUsd,
     ...firstUsage.usage,
   });
-  return parsed.payload;
+  return parsed;
 }
 
 function ensureParentDir(path: string): void {
@@ -1066,11 +1086,16 @@ async function handleComplex(
   messageId: string,
   bucket: BucketConfig,
   model: string,
+  lang: ReplyLang,
+  isForward = false,
+  userInstruction?: string,
 ): Promise<void> {
   const start = Date.now();
 
-  const result = await runClaude(instruction, bucket, model);
-  const memoryFile = appendBucketMemory(bucket.key, instruction, result);
+  const result = await runClaude(instruction, bucket, model, lang, isForward, userInstruction);
+  // Only persist to bucket memory when user explicitly asked to save (check user instruction, not doc content)
+  const persist = shouldPersist(userInstruction ?? instruction);
+  const memoryFile = persist ? appendBucketMemory(bucket.key, instruction, result) : null;
   let noteFile: string | null = null;
   if (result.save_note_markdown) {
     noteFile = appendDailyBrief(result.save_note_markdown);
@@ -1098,7 +1123,7 @@ async function handleComplex(
   });
 }
 
-function handleInbound(instruction: string, messageId: string, isForward = false): void {
+function handleInbound(instruction: string, messageId: string, isForward = false, lang: ReplyLang = "auto", userInstruction?: string): void {
   // Dispatch happens async — enqueue to a temporary holding queue, then re-enqueue to the right bucket
   (async () => {
     const start = Date.now();
@@ -1144,9 +1169,10 @@ function handleInbound(instruction: string, messageId: string, isForward = false
       // Try simple handlers only when Haiku explicitly says it's a simple data lookup
       if (dispatch.simple && !isForward) {
         const simple =
-          (await handleSimpleCalendar(instruction)) ??
-          (await handleSimpleTasks(instruction)) ??
-          (await handleSimpleEmail(instruction));
+          dispatch.bucket === "calendar" ? await handleSimpleCalendar(dispatch.dateStart, dispatch.dateEnd) :
+          dispatch.bucket === "general" && /task|待办|任务/i.test(instruction) ? await handleSimpleTasks(dispatch.dateStart, dispatch.dateEnd) :
+          dispatch.bucket === "email" ? await handleSimpleEmail() :
+          null;
 
         if (simple !== null) {
           await sendReply(simple, { type: "simple", messageId, bucket: bucket.key });
@@ -1163,25 +1189,23 @@ function handleInbound(instruction: string, messageId: string, isForward = false
       // Direct Sonnet API for tool-free tasks (Phase 1)
       if (!dispatch.tools && dispatch.model !== "opus") {
         const priorExchange = getDirectExchange(bucket.key);
-        const memoryText = readBucketMemory(bucket.key);
-        const memoryBlock = memoryText
-          ? `Recent ${bucket.label} context:\n${memoryText.trim().slice(0, 1500)}\n\n`
-          : "";
         const directPrompt = [
+          langDirective(lang),
+          "",
           `You are Claude Channel, a CEO's AI assistant (bucket: ${bucket.label}).`,
           "",
           "Formatting rules (STRICT):",
-          "- Respond in the same language the user writes in",
           "- Keep replies SHORT — max 10 lines for simple, max 20 for complex",
           "- Use bullet points, NOT tables",
           "- Bold key info: names, dates, amounts, decisions",
           "- Lead with the answer, then supporting details",
           "- Never say 'here is the summary' — just give the summary",
           "",
-          memoryBlock,
           priorExchange,
           "User message:",
           processed,
+          "",
+          langDirective(lang),
         ].filter(Boolean).join("\n");
 
         try {
@@ -1196,7 +1220,7 @@ function handleInbound(instruction: string, messageId: string, isForward = false
               distressReply: result.reply.slice(0, 200),
               directCostUsd: result.costUsd,
             });
-            await handleComplex(processed, messageId, bucket, model);
+            await handleComplex(processed, messageId, bucket, model, lang, isForward, userInstruction);
             return;
           }
 
@@ -1234,8 +1258,8 @@ function handleInbound(instruction: string, messageId: string, isForward = false
         }
       }
 
-      // Full claude -p path (tools, session resume, file access)
-      await handleComplex(processed, messageId, bucket, model);
+      // Full claude -p path (tools, file access)
+      await handleComplex(processed, messageId, bucket, model, lang, isForward, userInstruction);
     }).catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);
       log(`handleInbound error: ${message}`);
@@ -1262,17 +1286,14 @@ Bun.serve({
     const url = new URL(req.url);
 
     if (req.method === "GET" && url.pathname === "/health") {
-      const sessions = loadSessionState();
       return Response.json({
         status: "ok",
         service: "lark-channel",
         queueDepth: getTotalQueueDepth(),
         bucketQueueDepths: Object.fromEntries(bucketQueueDepths.entries()),
-        hasSession: Boolean(Object.keys(sessions).length),
         routeMode: CONFIG.routeMode,
         defaultModel: CONFIG.defaultModel,
         reasoningModel: CONFIG.reasoningModel,
-        maxSessionTurns: CONFIG.maxSessionTurns,
       });
     }
 
@@ -1302,6 +1323,7 @@ Bun.serve({
             messageId,
             bucket,
             CONFIG.defaultModel,
+            "auto",
           );
         }).catch((err) => {
           log(`debug test-distress handleComplex error: ${err}`);
@@ -1511,6 +1533,7 @@ Bun.serve({
 
     // Determine if this should be buffered (forwarded content, URL-only messages)
     const isUrlOnly = messageType === "text" && /^\s*https?:\/\/\S+\s*$/.test(text);
+    const larkDocMatch = isUrlOnly && /larksuite\.com\/(docx|wiki)\/([A-Za-z0-9]+)/.test(text.trim());
     const shouldBuffer = messageType === "interactive" || messageType === "post" || messageType === "file" || messageType === "image" || messageType === "merge_forward" || isUrlOnly;
 
     if (shouldBuffer) {
@@ -1519,21 +1542,33 @@ Bun.serve({
       const forwardText = text;
       const forwardId = messageId;
       const isFileOrImage = messageType === "file" || messageType === "image";
+      const contentLang: ReplyLang = (isFileOrImage || isUrlOnly) ? "auto" : detectLang(forwardText);
       // Haiku extraction starts NOW for text content — skip for files/images (Sonnet reads those directly)
       const extraction = isFileOrImage
         ? Promise.resolve({ default_action: `Read and summarize this ${messageType}.`, clean_extract: forwardText })
-        : isUrlOnly
-          ? Promise.resolve({ default_action: `Fetch and summarize this link: ${forwardText}`, clean_extract: forwardText })
-          : extractForward(forwardText);
+        : (isUrlOnly && larkDocMatch)
+          ? fetchLarkDoc(forwardText.trim()).then(content =>
+              content
+                ? { default_action: "Summarize this Lark document.", clean_extract: content }
+                : { default_action: `Fetch and summarize this link: ${forwardText}`, clean_extract: forwardText }
+            )
+          : isUrlOnly
+            ? Promise.resolve({ default_action: `Fetch and summarize this link: ${forwardText}`, clean_extract: forwardText })
+            : extractForward(forwardText);
       pendingForward = {
         messageId: forwardId,
         extraction,
+        contentLang,
         timer: setTimeout(async () => {
           // No follow-up arrived — use default action + content
           if (pendingForward?.messageId === forwardId) {
             pendingForward = null;
             const { default_action, clean_extract } = await extraction;
-            handleInbound(`Summarize the following forwarded content concisely. At the end, suggest a recommended next action.\n\nSuggested action: ${default_action}\n\n---\n\n${clean_extract}`, forwardId, true);
+            const langHint = clean_extract !== forwardText ? detectLang(clean_extract) : contentLang;
+            const summarizeInstruction = langHint === "zh"
+              ? `用中文简洁总结以下转发内容。最后给出建议的下一步行动。\n\n建议行动: ${default_action}\n\n---\n\n${clean_extract}`
+              : `Summarize the following forwarded content concisely. At the end, suggest a recommended next action.\n\nSuggested action: ${default_action}\n\n---\n\n${clean_extract}`;
+            handleInbound(summarizeInstruction, forwardId, true, langHint, "");
           }
         }, FORWARD_MERGE_WINDOW_MS),
       };
@@ -1548,14 +1583,18 @@ Bun.serve({
       // Await Haiku extraction, then merge user instruction with clean extract
       // Mark as forward since content is already Haiku-extracted (skip re-compression)
       pending.extraction.then(({ clean_extract }) => {
-        handleInbound(`${text}\n\n---\n\nForwarded content:\n${clean_extract}`, messageId, true);
+        // Compute lang: if user wrote text, use user's lang; if forward had fetched content, detect from it
+        const langHint: ReplyLang = pending.contentLang === "auto"
+          ? detectLang(text)
+          : pending.contentLang;
+        handleInbound(`${text}\n\n---\n\nForwarded content:\n${clean_extract}`, messageId, true, langHint, text);
       }).catch(() => {
-        handleInbound(text, messageId);
+        handleInbound(text, messageId, false, detectLang(text));
       });
       return Response.json({ ok: true });
     }
 
-    handleInbound(text, messageId);
+    handleInbound(text, messageId, false, detectLang(text));
     return Response.json({ ok: true });
   },
 });
