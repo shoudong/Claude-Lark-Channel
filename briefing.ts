@@ -127,6 +127,57 @@ async function runLarkCli(args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+// ─── Haiku direct API (data preprocessing) ──────────────────────────────────
+
+async function callHaikuDirect(
+  systemPrompt: string,
+  userContent: string,
+  maxTokens = 1024,
+): Promise<string> {
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    signal: AbortSignal.timeout(30_000),
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": CONFIG.anthropicApiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userContent }],
+    }),
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Haiku API ${resp.status}: ${err}`);
+  }
+  const data = (await resp.json()) as any;
+  return (data.content?.[0]?.text || "").trim();
+}
+
+/** Use Haiku to convert raw JSON data into compact readable markdown. */
+async function compressWithHaiku(
+  label: string,
+  raw: string,
+  instruction: string,
+): Promise<string> {
+  if (!raw || raw.length < 100) return raw;
+  try {
+    const result = await callHaikuDirect(
+      "You are a data formatter. Convert raw JSON into clean, compact markdown. Be terse — no filler, no explanations. Strip HTML tags. Output only the formatted result.",
+      `${instruction}\n\n${raw.slice(0, 12000)}`,
+      800,
+    );
+    log(`[haiku-compress] ${label}: ${raw.length} chars → ${result.length} chars`);
+    return result;
+  } catch (err) {
+    log(`[haiku-compress] ${label} failed, using raw: ${err}`);
+    return stripHtml(raw);
+  }
+}
+
 // ─── Opus 4.6 direct API ────────────────────────────────────────────────────
 
 type ClaudeUsage = {
@@ -310,6 +361,56 @@ async function gatherTasks(): Promise<string> {
   return runLarkCli(["task", "+get-my-tasks", "--format", "json"]);
 }
 
+/** Strip HTML tags from task data — Lark stores descriptions as HTML. */
+function stripHtml(raw: string): string {
+  return raw
+    .replace(/<br\s*\/?>/gi, "\n")   // <br> → newline
+    .replace(/<[^>]+>/g, "")         // all other tags → nothing
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"');
+}
+
+/** Filter out tasks overdue by more than `days` days, and strip HTML. */
+function preprocessTasks(raw: string, maxOverdueDays = 14): string {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - maxOverdueDays);
+  const cutoffMs = cutoff.getTime();
+
+  try {
+    const parsed = JSON.parse(raw);
+    const items: any[] =
+      parsed?.data?.items ?? parsed?.items ?? parsed?.data ?? [];
+
+    const filtered = items.filter((t: any) => {
+      const due = t.due?.timestamp
+        ? Number(t.due.timestamp) * 1000
+        : t.due?.date
+          ? new Date(t.due.date).getTime()
+          : null;
+      if (due === null) return true; // no due date → keep
+      const isOverdue = due < Date.now();
+      if (!isOverdue) return true;
+      return due >= cutoffMs; // only keep if overdue within cutoff window
+    });
+
+    // Strip HTML from summary and notes
+    const cleaned = filtered.map((t: any) => ({
+      ...t,
+      summary: t.summary ? stripHtml(t.summary) : t.summary,
+      notes: t.notes ? stripHtml(t.notes) : t.notes,
+      content: t.content ? stripHtml(t.content) : t.content,
+    }));
+
+    return JSON.stringify({ ...parsed, data: { ...parsed?.data, items: cleaned } });
+  } catch {
+    // Not valid JSON — just strip HTML from raw string
+    return stripHtml(raw);
+  }
+}
+
 async function gatherEmailTriage(max = 20): Promise<string> {
   return runLarkCli([
     "mail",
@@ -475,22 +576,38 @@ async function generateDailyBriefing(): Promise<void> {
   const priorContext = findPriorContext();
   const contextLabel = dow === 1 ? "Last Week" : "Yesterday";
 
+  // Pre-process raw JSON with Haiku — reduces Opus input tokens significantly
+  const [calendarFmt, tasksFmt, emailsFmt, emailBodiesFmt] = await Promise.all([
+    calendar.error
+      ? Promise.resolve(`[Calendar unavailable: ${calendar.error}]`)
+      : compressWithHaiku("calendar", calendar.data || "", "Format these calendar events as a clean bullet list: time, title, key attendees only. One line per event."),
+    tasks.error
+      ? Promise.resolve(`[Tasks unavailable: ${tasks.error}]`)
+      : compressWithHaiku("tasks", preprocessTasks(tasks.data || ""), "Format these tasks as a bullet list: task name, due date, status. Mark overdue items with ⚠️. Skip tasks with no name."),
+    emails.error
+      ? Promise.resolve(`[Email unavailable: ${emails.error}]`)
+      : compressWithHaiku("emails", emails.data || "", "Format these emails as a bullet list: sender, subject, one-line summary. Most important first."),
+    emailBodies
+      ? compressWithHaiku("email-bodies", emailBodies, "For each email extract: sender, subject, key ask or decision needed. 2 lines max per email.")
+      : Promise.resolve("[No email details available]"),
+  ]);
+
   const userPrompt = `Generate the CEO's morning briefing for **${date} (${dayName})**.
 
 ## Prior Context
 ${priorContext}
 
 ## Today's Calendar
-${calendar.error ? `[Calendar unavailable: ${calendar.error}]` : calendar.data || "[No events]"}
+${calendarFmt}
 
-## Open Tasks
-${tasks.error ? `[Tasks unavailable: ${tasks.error}]` : tasks.data || "[No tasks]"}
+## Open Tasks (overdue shown only if within past 14 days)
+${tasksFmt}
 
-## Recent Emails (inbox summaries)
-${emails.error ? `[Email unavailable: ${emails.error}]` : emails.data || "[No emails]"}
+## Recent Emails
+${emailsFmt}
 
 ## Email Details (top items)
-${emailBodies || "[No email details available]"}
+${emailBodiesFmt}
 
 ---
 Instructions:
@@ -545,6 +662,19 @@ async function generateEodSummary(): Promise<void> {
     gatherSafe("email", () => gatherEmailTriage(30), ""),
   ]);
 
+  // Pre-process raw JSON with Haiku before Opus
+  const [calendarFmt, tasksFmt, emailsFmt] = await Promise.all([
+    calendar.error
+      ? Promise.resolve(`[Calendar unavailable: ${calendar.error}]`)
+      : compressWithHaiku("eod-calendar", calendar.data || "", "Format these calendar events as a bullet list: time, title, attendees. One line per event."),
+    tasks.error
+      ? Promise.resolve(`[Tasks unavailable: ${tasks.error}]`)
+      : compressWithHaiku("eod-tasks", preprocessTasks(tasks.data || ""), "Format these tasks as a bullet list: task name, due date, status. Mark overdue with ⚠️."),
+    emails.error
+      ? Promise.resolve(`[Email unavailable: ${emails.error}]`)
+      : compressWithHaiku("eod-emails", emails.data || "", "Format these emails as a bullet list: sender, subject, one-line summary."),
+  ]);
+
   const userPrompt = `Generate the CEO's end-of-day summary for **${date} (${dayName})**.
 
 ## This Morning's Briefing
@@ -554,13 +684,13 @@ ${dailyBrief.slice(0, 6000)}
 ${channelActivity.slice(0, 8000)}
 
 ## Today's Calendar (completed + remaining)
-${calendar.error ? `[Calendar unavailable: ${calendar.error}]` : calendar.data || "[No events]"}
+${calendarFmt}
 
-## Current Tasks
-${tasks.error ? `[Tasks unavailable: ${tasks.error}]` : tasks.data || "[No tasks]"}
+## Current Tasks (overdue shown only if within past 14 days)
+${tasksFmt}
 
 ## Email Activity Today
-${emails.error ? `[Email unavailable: ${emails.error}]` : emails.data || "[No emails]"}
+${emailsFmt}
 
 ---
 Instructions:
@@ -615,6 +745,9 @@ async function generateWeeklySummary(): Promise<void> {
   }
 
   const tasks = await gatherSafe("tasks", () => gatherTasks(), "");
+  const tasksFmt = tasks.error
+    ? `[Tasks unavailable: ${tasks.error}]`
+    : await compressWithHaiku("weekly-tasks", preprocessTasks(tasks.data || ""), "Format these tasks as a bullet list: task name, due date, status. Mark overdue with ⚠️.");
 
   const userPrompt = `Generate the CEO's weekly summary for the week of **${monDate} to ${friDate}**.
 
@@ -624,8 +757,8 @@ ${dailyBriefs.length ? dailyBriefs.join("\n\n") : "[No daily briefs found this w
 ## EoD Summaries This Week
 ${eodSummaries.length ? eodSummaries.join("\n\n") : "[No EoD summaries found this week]"}
 
-## Current Task Status
-${tasks.error ? `[Tasks unavailable: ${tasks.error}]` : tasks.data || "[No tasks]"}
+## Current Task Status (overdue shown only if within past 14 days)
+${tasksFmt}
 
 ---
 Instructions:

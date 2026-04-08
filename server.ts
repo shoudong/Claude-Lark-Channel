@@ -1407,16 +1407,23 @@ function handleInbound(instruction: string, messageId: string, isForward = false
       const sepIdx = instruction.indexOf("---\n");
       const hasEmbeddedContent = sepIdx > 0 && instruction.length > 500;
       if (hasEmbeddedContent) {
-        // Extract just the user's actual instruction, stripping the server-generated auto-summary prefix
-        const userPart = (userInstruction || "").trim();
-        // Auto-summary (no user instruction) — content is embedded, only needs text processing
-        if (!userPart) {
-          dispatch.tools = false;
-        } else {
-          // User gave an instruction — check if it's just text processing
-          const isSummaryTask = /总结|summarize|summary|translate|翻译|rewrite|改写|extract|提取|analyze|分析/i.test(userPart);
-          if (isSummaryTask && !needsTools(userPart)) {
+        const embeddedContent = instruction.slice(sepIdx + 4).trim();
+        // Never downgrade if the embedded "content" is just a URL — Claude needs web tools to fetch it
+        // Handles both bare URL and "Forwarded content:\nhttps://..." from the merge path
+        const embeddedCore = embeddedContent.replace(/^forwarded content:\s*/i, "").trim();
+        const embeddedIsUrl = /^https?:\/\/\S+$/.test(embeddedCore);
+        if (!embeddedIsUrl) {
+          // Extract just the user's actual instruction, stripping the server-generated auto-summary prefix
+          const userPart = (userInstruction || "").trim();
+          // Auto-summary (no user instruction) — content is embedded, only needs text processing
+          if (!userPart) {
             dispatch.tools = false;
+          } else {
+            // User gave an instruction — check if it's just text processing
+            const isSummaryTask = /总结|summarize|summary|translate|翻译|rewrite|改写|extract|提取|analyze|分析/i.test(userPart);
+            if (isSummaryTask && !needsTools(userPart)) {
+              dispatch.tools = false;
+            }
           }
         }
       }
