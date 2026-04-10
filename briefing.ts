@@ -192,11 +192,14 @@ async function callOpusDirect(
   userContent: string,
   maxTokens = 8192,
 ): Promise<{ text: string; usage: ClaudeUsage; costUsd: number }> {
-  const API_TIMEOUT_MS = 180_000; // 3 minutes — Opus can be slow but shouldn't take longer
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+  const API_TIMEOUT_MS = 600_000; // 10 minutes — Opus can be slow under load
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      signal: controller.signal,
       headers: {
         "content-type": "application/json",
         "x-api-key": CONFIG.anthropicApiKey,
@@ -209,30 +212,30 @@ async function callOpusDirect(
         messages: [{ role: "user", content: userContent }],
       }),
     });
-    if (resp.ok) {
-      const data = (await resp.json()) as any;
-      const text = (data.content?.[0]?.text || "").trim();
-      const usage: ClaudeUsage = {
-        input_tokens: data.usage?.input_tokens || 0,
-        output_tokens: data.usage?.output_tokens || 0,
-        cache_creation_input_tokens:
-          data.usage?.cache_creation_input_tokens || 0,
-        cache_read_input_tokens: data.usage?.cache_read_input_tokens || 0,
-      };
-      // Opus pricing: $15/M input, $75/M output
-      const costUsd =
-        (usage.input_tokens * 15 + usage.output_tokens * 75) / 1_000_000;
-      return { text, usage, costUsd };
-    }
-    const errBody = await resp.text();
-    if (attempt < 2) {
-      log(`Opus attempt ${attempt} failed (${resp.status}), retrying in 3s…`);
-      await Bun.sleep(3000);
-    } else {
-      throw new Error(`Opus API ${resp.status}: ${errBody}`);
-    }
+  } catch (err: any) {
+    clearTimeout(timer);
+    if (err?.name === "AbortError" || controller.signal.aborted)
+      throw new Error(`Opus API timed out after ${API_TIMEOUT_MS / 1000}s`);
+    throw err;
   }
-  throw new Error("unreachable");
+  clearTimeout(timer);
+  if (!resp.ok) {
+    const errBody = await resp.text();
+    throw new Error(`Opus API ${resp.status}: ${errBody}`);
+  }
+  const data = (await resp.json()) as any;
+  const text = (data.content?.[0]?.text || "").trim();
+  const usage: ClaudeUsage = {
+    input_tokens: data.usage?.input_tokens || 0,
+    output_tokens: data.usage?.output_tokens || 0,
+    cache_creation_input_tokens:
+      data.usage?.cache_creation_input_tokens || 0,
+    cache_read_input_tokens: data.usage?.cache_read_input_tokens || 0,
+  };
+  // Opus pricing: $15/M input, $75/M output
+  const costUsd =
+    (usage.input_tokens * 15 + usage.output_tokens * 75) / 1_000_000;
+  return { text, usage, costUsd };
 }
 
 // ─── Lark messaging ─────────────────────────────────────────────────────────
@@ -272,6 +275,7 @@ function formatForLark(text: string): string {
       return cols.length ? `- ${cols.join(" · ")}` : row;
     })
     .replace(/^\|[-| ]+\|?$/gm, "")
+    .replace(/^---+$/gm, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
@@ -280,7 +284,7 @@ function formatForLark(text: string): string {
   const nl = cut.lastIndexOf("\n");
   return (
     cut.slice(0, nl) +
-    "\n\n---\n_Full briefing saved to Obsidian. Showing top items only._"
+    "\n\n_Full briefing saved to Obsidian. Showing top items only._"
   );
 }
 
@@ -411,29 +415,6 @@ function preprocessTasks(raw: string, maxOverdueDays = 14): string {
   }
 }
 
-async function gatherEmailTriage(max = 20): Promise<string> {
-  return runLarkCli([
-    "mail",
-    "+triage",
-    "--format",
-    "json",
-    "--max",
-    String(max),
-  ]);
-}
-
-async function gatherEmailBodies(messageIds: string[]): Promise<string> {
-  if (!messageIds.length) return "[]";
-  return runLarkCli([
-    "mail",
-    "+messages",
-    "--message-ids",
-    messageIds.join(","),
-    "--format",
-    "json",
-  ]);
-}
-
 function readFileOr(path: string, fallback: string): string {
   try {
     if (existsSync(path)) return readFileSync(path, "utf8");
@@ -543,53 +524,22 @@ async function generateDailyBriefing(): Promise<void> {
   log(`Generating daily briefing for ${date} (${dayName})`);
 
   // Gather data in parallel
-  const [calendar, tasks, emails] = await Promise.all([
+  const [calendar, tasks] = await Promise.all([
     gatherSafe("calendar", () => gatherCalendar(), ""),
     gatherSafe("tasks", () => gatherTasks(), ""),
-    gatherSafe("email", () => gatherEmailTriage(20), ""),
   ]);
-
-  // Try to fetch email bodies for top unread items
-  let emailBodies = "";
-  try {
-    if (emails.data) {
-      const parsed = JSON.parse(emails.data);
-      const msgs =
-        parsed.data?.messages || parsed.messages || parsed.data || [];
-      const ids = msgs
-        .slice(0, 5)
-        .map((m: any) => m.message_id)
-        .filter(Boolean);
-      if (ids.length) {
-        const r = await gatherSafe(
-          "email_bodies",
-          () => gatherEmailBodies(ids),
-          "",
-        );
-        emailBodies = r.data;
-      }
-    }
-  } catch {
-    /* non-critical */
-  }
 
   const priorContext = findPriorContext();
   const contextLabel = dow === 1 ? "Last Week" : "Yesterday";
 
   // Pre-process raw JSON with Haiku — reduces Opus input tokens significantly
-  const [calendarFmt, tasksFmt, emailsFmt, emailBodiesFmt] = await Promise.all([
+  const [calendarFmt, tasksFmt] = await Promise.all([
     calendar.error
       ? Promise.resolve(`[Calendar unavailable: ${calendar.error}]`)
       : compressWithHaiku("calendar", calendar.data || "", "Format these calendar events as a clean bullet list: time, title, key attendees only. One line per event."),
     tasks.error
       ? Promise.resolve(`[Tasks unavailable: ${tasks.error}]`)
       : compressWithHaiku("tasks", preprocessTasks(tasks.data || ""), "Format these tasks as a bullet list: task name, due date, status. Mark overdue items with ⚠️. Skip tasks with no name."),
-    emails.error
-      ? Promise.resolve(`[Email unavailable: ${emails.error}]`)
-      : compressWithHaiku("emails", emails.data || "", "Format these emails as a bullet list: sender, subject, one-line summary. Most important first."),
-    emailBodies
-      ? compressWithHaiku("email-bodies", emailBodies, "For each email extract: sender, subject, key ask or decision needed. 2 lines max per email.")
-      : Promise.resolve("[No email details available]"),
   ]);
 
   const userPrompt = `Generate the CEO's morning briefing for **${date} (${dayName})**.
@@ -603,12 +553,6 @@ ${calendarFmt}
 ## Open Tasks (overdue shown only if within past 14 days)
 ${tasksFmt}
 
-## Recent Emails
-${emailsFmt}
-
-## Email Details (top items)
-${emailBodiesFmt}
-
 ---
 Instructions:
 1. Start with "# Daily Brief — ${date} (${dayName})"
@@ -616,8 +560,7 @@ Instructions:
 3. "## Calendar (N meetings)" — time, title, key attendees. Flag conflicts ⚠️. For meetings with description/agenda, provide 2-3 prep bullet points.
 4. "## Meeting Prep" — for each meeting that has an agenda or description, digest it and provide prep guidance, key questions to address, and context the CEO should have going in.
 5. "## Open Tasks" — list with any overdue flags
-6. "## Email Highlights" — top emails needing attention, with recommended action
-7. "## Action Items" — numbered list of concrete actions for today, ordered by priority`;
+6. "## Action Items" — numbered list of concrete actions for today, ordered by priority`;
 
   log("Calling Opus 4.6…");
   const result = await callOpusDirect(SYSTEM_PROMPT, userPrompt);
@@ -656,29 +599,25 @@ async function generateEodSummary(): Promise<void> {
   );
   const channelActivity = readChannelMemoryForDate(date);
 
-  const [calendar, tasks, emails] = await Promise.all([
+  const [calendar, tasks] = await Promise.all([
     gatherSafe("calendar", () => gatherCalendar(), ""),
     gatherSafe("tasks", () => gatherTasks(), ""),
-    gatherSafe("email", () => gatherEmailTriage(30), ""),
   ]);
 
   // Pre-process raw JSON with Haiku before Opus
-  const [calendarFmt, tasksFmt, emailsFmt] = await Promise.all([
+  const [calendarFmt, tasksFmt] = await Promise.all([
     calendar.error
       ? Promise.resolve(`[Calendar unavailable: ${calendar.error}]`)
       : compressWithHaiku("eod-calendar", calendar.data || "", "Format these calendar events as a bullet list: time, title, attendees. One line per event."),
     tasks.error
       ? Promise.resolve(`[Tasks unavailable: ${tasks.error}]`)
       : compressWithHaiku("eod-tasks", preprocessTasks(tasks.data || ""), "Format these tasks as a bullet list: task name, due date, status. Mark overdue with ⚠️."),
-    emails.error
-      ? Promise.resolve(`[Email unavailable: ${emails.error}]`)
-      : compressWithHaiku("eod-emails", emails.data || "", "Format these emails as a bullet list: sender, subject, one-line summary."),
   ]);
 
   const userPrompt = `Generate the CEO's end-of-day summary for **${date} (${dayName})**.
 
 ## This Morning's Briefing
-${dailyBrief.slice(0, 6000)}
+${dailyBrief.slice(0, 4000)}
 
 ## Today's Channel Activity (interactions through Lark AI channel)
 ${channelActivity.slice(0, 8000)}
@@ -689,17 +628,13 @@ ${calendarFmt}
 ## Current Tasks (overdue shown only if within past 14 days)
 ${tasksFmt}
 
-## Email Activity Today
-${emailsFmt}
-
 ---
 Instructions:
 1. Start with "# EoD Summary — ${date} (${dayName})"
 2. "## Key Meetings" — which meetings happened today, key outcomes, decisions made, action items generated (cross-reference calendar with channel activity)
-3. "## Key Emails" — important emails received/sent today, what was decided or needs follow-up
-4. "## Decisions & Insights" — decisions made, documents reviewed, notable insights from channel activity
-5. "## Open Loops" — items started but not finished, promises made, follow-ups needed
-6. "## Closing Notes" — 5-7 bullet executive summary for tomorrow's morning briefing to pick up. This is the **most important section** — it feeds directly into tomorrow's daily brief. Be specific: include names, dates, and next actions.`;
+3. "## Decisions & Insights" — decisions made, documents reviewed, notable insights from channel activity
+4. "## Open Loops" — items started but not finished, promises made, follow-ups needed
+5. "## Closing Notes" — 5-7 bullet executive summary for tomorrow's morning briefing to pick up. This is the **most important section** — it feeds directly into tomorrow's daily brief. Be specific: include names, dates, and next actions.`;
 
   log("Calling Opus 4.6…");
   const result = await callOpusDirect(SYSTEM_PROMPT, userPrompt);
