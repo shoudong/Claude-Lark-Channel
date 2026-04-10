@@ -187,14 +187,16 @@ type ClaudeUsage = {
   cache_read_input_tokens: number;
 };
 
-async function callOpusDirect(
+/** Call a Claude model with retry + Sonnet fallback on timeout. */
+async function callClaudeDirect(
+  model: string,
   systemPrompt: string,
   userContent: string,
-  maxTokens = 8192,
-): Promise<{ text: string; usage: ClaudeUsage; costUsd: number }> {
-  const API_TIMEOUT_MS = 600_000; // 10 minutes — Opus can be slow under load
+  maxTokens: number,
+  timeoutMs: number,
+): Promise<{ text: string; usage: ClaudeUsage; costUsd: number; model: string }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let resp: Response;
   try {
     resp = await fetch("https://api.anthropic.com/v1/messages", {
@@ -206,7 +208,7 @@ async function callOpusDirect(
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-opus-4-6",
+        model,
         max_tokens: maxTokens,
         system: systemPrompt,
         messages: [{ role: "user", content: userContent }],
@@ -215,13 +217,13 @@ async function callOpusDirect(
   } catch (err: any) {
     clearTimeout(timer);
     if (err?.name === "AbortError" || controller.signal.aborted)
-      throw new Error(`Opus API timed out after ${API_TIMEOUT_MS / 1000}s`);
+      throw new Error(`${model} timed out after ${timeoutMs / 1000}s`);
     throw err;
   }
   clearTimeout(timer);
   if (!resp.ok) {
     const errBody = await resp.text();
-    throw new Error(`Opus API ${resp.status}: ${errBody}`);
+    throw new Error(`${model} API ${resp.status}: ${errBody}`);
   }
   const data = (await resp.json()) as any;
   const text = (data.content?.[0]?.text || "").trim();
@@ -232,10 +234,55 @@ async function callOpusDirect(
       data.usage?.cache_creation_input_tokens || 0,
     cache_read_input_tokens: data.usage?.cache_read_input_tokens || 0,
   };
-  // Opus pricing: $15/M input, $75/M output
-  const costUsd =
-    (usage.input_tokens * 15 + usage.output_tokens * 75) / 1_000_000;
-  return { text, usage, costUsd };
+  // Pricing: Opus $15/$75, Sonnet $3/$15 per M tokens
+  const isOpus = model.includes("opus");
+  const costUsd = isOpus
+    ? (usage.input_tokens * 15 + usage.output_tokens * 75) / 1_000_000
+    : (usage.input_tokens * 3 + usage.output_tokens * 15) / 1_000_000;
+  return { text, usage, costUsd, model };
+}
+
+/**
+ * Try Opus with retry + exponential backoff, fall back to Sonnet on persistent failure.
+ * - Attempt 1: Opus (5 min timeout)
+ * - Wait 30s
+ * - Attempt 2: Opus (5 min timeout)
+ * - Wait 60s
+ * - Attempt 3: Opus (5 min timeout)
+ * - Fallback: Sonnet (3 min timeout)
+ */
+async function callOpusDirect(
+  systemPrompt: string,
+  userContent: string,
+  maxTokens = 8192,
+): Promise<{ text: string; usage: ClaudeUsage; costUsd: number }> {
+  const OPUS = "claude-opus-4-6";
+  const SONNET = "claude-sonnet-4-6";
+  const OPUS_TIMEOUT = 300_000;  // 5 min per attempt
+  const SONNET_TIMEOUT = 180_000; // 3 min
+  const BACKOFFS = [30_000, 60_000]; // wait between retries
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const result = await callClaudeDirect(OPUS, systemPrompt, userContent, maxTokens, OPUS_TIMEOUT);
+      if (attempt > 1) log(`Opus succeeded on attempt ${attempt}`);
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`Opus attempt ${attempt}/3 failed: ${msg}`);
+      if (attempt < 3) {
+        const wait = BACKOFFS[attempt - 1];
+        log(`Waiting ${wait / 1000}s before retry…`);
+        await Bun.sleep(wait);
+      }
+    }
+  }
+
+  // Fallback to Sonnet
+  log("Opus failed 3 times, falling back to Sonnet…");
+  const result = await callClaudeDirect(SONNET, systemPrompt, userContent, maxTokens, SONNET_TIMEOUT);
+  log(`Sonnet fallback succeeded`);
+  return result;
 }
 
 // ─── Lark messaging ─────────────────────────────────────────────────────────
