@@ -323,7 +323,10 @@ function formatForLark(text: string): string {
     })
     .replace(/^\|[-| ]+\|?$/gm, "")
     .replace(/^---+$/gm, "")
+    .replace(/<br\s*\/?>/gi, "\n")
     .replace(/\n{3,}/g, "\n\n")
+    // Lark renders blank lines between consecutive headings as literal <br>
+    .replace(/^(#{1,6}\s.+)\n\n(#{1,6}\s)/gm, "$1\n$2")
     .trim();
 
   if (out.length <= 4500) return out;
