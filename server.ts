@@ -1164,6 +1164,9 @@ function enqueue<T>(bucketKey: string, task: () => Promise<T>): Promise<T> {
 
 const PENDING_COMMAND_RE = /^\/pending\b|^pending(?:\s+@?mentions?)?\s*$|who.*waiting on me|unanswered.*@|pending.*@\s*me|mention.*(?:my name|me).*(?:pending|respond|reply|unanswered)|pending.*(?:my (?:response|reply))|谁.*@.*我|未回复|@.*我.*未回/i;
 
+// Advisor system skills — force-route to claude -p for Agent tool access
+const ADVISOR_COMMAND_RE = /^\/(musk|munger|dalio|bezos|buffett|naval|jensen|advisor-router|advisors|compare-advisors)\b/i;
+
 async function fetchUnreadMentions(): Promise<string | null> {
   try {
     // Search @me messages from the last 3 days
@@ -1383,6 +1386,40 @@ function handleInbound(instruction: string, messageId: string, isForward = false
         const message = error instanceof Error ? error.message : String(error);
         log(`pending command error: ${message}`);
         try { await sendReply("Error fetching pending items. Please retry.", { type: "error", messageId }); } catch { /* ignore */ }
+      });
+      return;
+    }
+
+    // Fast-path: advisor system commands — skip Haiku dispatch, force claude -p with Agent tool
+    const advisorMatch = !isForward && ADVISOR_COMMAND_RE.exec(instruction.trim());
+    if (advisorMatch) {
+      const advisorCmd = advisorMatch[1].toLowerCase();
+      // Multi-advisor commands benefit from opus; single advisors work well with sonnet
+      const useOpus = ["advisor-router", "advisors", "compare-advisors"].includes(advisorCmd);
+      const model = useOpus ? CONFIG.reasoningModel : CONFIG.defaultModel;
+      const bucket = bucketConfig("general");
+      addRecentMessage(instruction, "general", false);
+
+      enqueue(bucket.key, async () => {
+        logJson(EVENTS_FILE, {
+          type: "inbound",
+          messageId,
+          instruction: instruction.slice(0, 300),
+          routeMode: "advisor_skill",
+          bucket: bucket.key,
+          model,
+          dispatchReason: `advisor_command: /${advisorCmd}`,
+          isForward: false,
+          simple: false,
+          tools: true,
+          compressed: false,
+          queueAhead: getBucketQueueDepth(bucket.key),
+        });
+        await handleComplex(instruction, messageId, bucket, model, lang, false, instruction);
+      }).catch(async (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        log(`advisor command error: ${message}`);
+        try { await sendReply("Advisor analysis failed. Please retry.", { type: "error", messageId }); } catch { /* ignore */ }
       });
       return;
     }
